@@ -224,6 +224,17 @@ class InteractiveFlowTests(unittest.TestCase):
 
 
 class PlatformSupportTests(unittest.TestCase):
+    def test_windows_console_is_configured_for_utf8(self) -> None:
+        stdout = mock.Mock()
+        stderr = mock.Mock()
+        with mock.patch.object(dw, "IS_WINDOWS", True), mock.patch.object(
+            dw.sys, "stdout", stdout
+        ), mock.patch.object(dw.sys, "stderr", stderr):
+            dw.configure_console()
+
+        stdout.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+
     def test_dependency_http_query_retries_transient_failure(self) -> None:
         response = io.StringIO('{"ok": true}')
         with mock.patch.object(

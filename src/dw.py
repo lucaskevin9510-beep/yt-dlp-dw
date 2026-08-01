@@ -52,6 +52,20 @@ APP_VERSION = "1.1.0"
 IS_WINDOWS = os.name == "nt"
 
 
+def configure_console() -> None:
+    """Use UTF-8 for interactive output, including when imported on Windows."""
+    if not IS_WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(OSError, ValueError):
+                reconfigure(encoding="utf-8", errors="replace")
+
+
+configure_console()
+
+
 def windows_downloads_directory() -> Path:
     """Resolve the current user's redirected Windows Downloads known folder."""
     home = Path(os.environ.get("USERPROFILE") or Path.home())
@@ -2289,18 +2303,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def configure_console() -> None:
-    if not IS_WINDOWS:
-        return
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            with contextlib.suppress(OSError, ValueError):
-                reconfigure(encoding="utf-8", errors="replace")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    configure_console()
     args = parse_args(argv)
     try:
         require_root_and_platform()
