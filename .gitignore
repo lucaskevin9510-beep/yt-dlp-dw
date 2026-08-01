@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.tmp
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+tests/tmp*/
