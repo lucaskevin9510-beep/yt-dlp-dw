@@ -222,6 +222,13 @@ class InteractiveFlowTests(unittest.TestCase):
 
 
 class FilesystemSafetyTests(unittest.TestCase):
+    def test_inaccessible_cookie_file_is_treated_as_absent(self) -> None:
+        inaccessible = mock.Mock()
+        inaccessible.is_file.side_effect = PermissionError("permission denied")
+        with mock.patch.object(dw, "COOKIE_FILE", inaccessible):
+            self.assertFalse(dw.cookie_file_available())
+            self.assertNotIn("--cookies", dw.ytdlp_base_args())
+
     def test_filename_preserves_unicode_and_removes_unsafe_characters(self) -> None:
         value = dw.sanitize_filename('中文/日本語:*? "test"')
         self.assertIn("中文", value)

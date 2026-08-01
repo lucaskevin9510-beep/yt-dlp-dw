@@ -386,6 +386,22 @@ def ytdlp_environment() -> dict[str, str]:
     return env
 
 
+def cookie_file_available() -> bool:
+    """Return whether the configured cookies file can safely be read."""
+    try:
+        return COOKIE_FILE.is_file() and os.access(COOKIE_FILE, os.R_OK)
+    except OSError:
+        return False
+
+
+def cookie_path_present() -> bool:
+    """Return whether the cookie path exists without leaking filesystem errors."""
+    try:
+        return COOKIE_FILE.exists() or COOKIE_FILE.is_symlink()
+    except OSError:
+        return False
+
+
 def ytdlp_base_args() -> list[str]:
     args = [
         str(YT_DLP),
@@ -399,7 +415,7 @@ def ytdlp_base_args() -> list[str]:
         "--no-write-comments",
         "--no-write-playlist-metafiles",
     ]
-    if COOKIE_FILE.is_file():
+    if cookie_file_available():
         args.extend(("--cookies", str(COOKIE_FILE)))
     return args
 
@@ -416,7 +432,7 @@ def looks_cookie_related(text: str) -> bool:
         "authentication required",
         "not a bot",
     )
-    return COOKIE_FILE.is_file() and any(pattern in lowered for pattern in strong_patterns)
+    return cookie_file_available() and any(pattern in lowered for pattern in strong_patterns)
 
 
 def run_capture(args: Sequence[str]) -> str:
@@ -1433,7 +1449,7 @@ def ensure_final_container(path: Path, selection: ItemSelection) -> Path:
 
 def thumbnail_opener() -> urllib.request.OpenerDirector:
     handlers: list[Any] = []
-    if COOKIE_FILE.is_file():
+    if cookie_file_available():
         jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
         try:
             jar.load(ignore_discard=True, ignore_expires=False)
@@ -1629,7 +1645,7 @@ def wait_for_upcoming(url: str) -> dict[str, Any]:
 
 
 def cookie_status() -> None:
-    if COOKIE_FILE.is_file():
+    if cookie_file_available():
         info(f"已发现并启用 cookies：{COOKIE_FILE}")
     else:
         info(f"未检测到 cookies：{COOKIE_FILE}")
@@ -1888,7 +1904,7 @@ def uninstall() -> None:
             path.unlink()
         except OSError as exc:
             failures.append(f"{path}：{exc}")
-    if delete_cookie and (COOKIE_FILE.exists() or COOKIE_FILE.is_symlink()):
+    if delete_cookie and cookie_path_present():
         try:
             COOKIE_FILE.unlink()
         except OSError as exc:
@@ -1939,7 +1955,7 @@ def uninstall() -> None:
             error(failure)
     else:
         info("dw、专用依赖、缓存、状态和清单内下载文件均已删除。")
-        if not delete_cookie and COOKIE_FILE.exists():
+        if not delete_cookie and cookie_path_present():
             info(f"已按你的选择保留：{COOKIE_FILE}")
 
 
