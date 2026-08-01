@@ -1,6 +1,6 @@
 # yt-dlp-dw
 
-`dw` 是面向 **Debian 12/13（x86_64/amd64）**、仅供 `root` 使用的交互式下载助手。它基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp)，会先完整列出可播放的视频与独立音频版本，让用户明确选择后再下载、无损封装，并将成品直接保存到 `/root`。
+`dw` 是面向 **Windows 10/11 x64** 和 **Debian 12/13 x86_64** 的交互式下载助手。它基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp)，会先完整列出可播放的视频与独立音频版本，让用户明确选择后再下载、无损封装。Windows 成品保存到当前用户的 Downloads 已知文件夹，Debian 成品保存到 `/root`。
 
 > 请只下载你有权访问和保存的内容，并遵守网站条款及当地法律。`dw` 不绕过 DRM，也不能保证所有网站始终可用；实际站点支持能力由当前 yt-dlp 版本决定。
 
@@ -14,14 +14,32 @@
 | 文件容器 | 每次选择自动、MP4、MKV 或 WebM；不转码，不兼容时要求重新选择并推荐 MKV |
 | 播放列表 | 分页显示项目，支持单选、多选、范围和全部；第一项的规则可自动应用到后续项目 |
 | 图片 | 列出并去重所有可下载缩略图，支持多选或全部下载，最终统一保存为 PNG |
-| Cookies | 自动读取 `/root/cookies.txt`，并明确提示已启用、未检测到或可能失效 |
+| Cookies | Windows 读取 `%USERPROFILE%\cookies.txt`，Debian 读取 `/root/cookies.txt` |
 | 直播 | 可录制正在直播、即将开始或持续直播的内容；支持安全停止与强制取消 |
-| 输出与清理 | 成品直接保存到 `/root`，同名自动改名；失败或取消时按任务清理文件 |
+| 输出与清理 | Windows 保存到 Downloads，Debian 保存到 `/root`；同名自动改名，失败或取消时按任务清理 |
 | 依赖与卸载 | 自动安装或更新 yt-dlp nightly、Deno、FFmpeg；提供带清单保护的完整卸载功能 |
 
 ## 快速安装
 
-本程序只能由 `root` 运行。普通用户先进入 root shell：
+### Windows 10/11 x64
+
+无需管理员权限，也不需要预装 Python、yt-dlp、Deno 或 FFmpeg。打开 PowerShell、CMD 或 Windows Terminal，运行：
+
+```powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod 'https://raw.githubusercontent.com/lucaskevin9510-beep/yt-dlp-dw/main/install-windows.ps1' | Invoke-Expression"
+```
+
+安装完成后输入：
+
+```powershell
+dw
+```
+
+如果当前终端还找不到命令，请关闭并重新打开终端。Windows 的安装、使用、Cookies、更新、卸载和故障处理详见 [Windows 10/11 完整说明](docs/WINDOWS.md)。
+
+### Debian 12/13 x86_64
+
+Debian 版只能由 `root` 运行。普通用户先进入 root shell：
 
 ```bash
 sudo -i
@@ -39,13 +57,13 @@ id -u
 curl -fsSL https://raw.githubusercontent.com/lucaskevin9510-beep/yt-dlp-dw/main/install.sh | bash
 ```
 
-安装完成后，在任意目录输入：
+安装完成后输入：
 
 ```bash
 dw
 ```
 
-如果你希望先审阅安装器再执行：
+如果希望先审阅 Debian 安装器再执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lucaskevin9510-beep/yt-dlp-dw/main/install.sh -o /tmp/install-dw.sh
@@ -54,7 +72,7 @@ bash /tmp/install-dw.sh
 rm -f /tmp/install-dw.sh
 ```
 
-安装命令本身需要系统已有 `curl`。如果没有：
+Debian 安装命令需要系统已有 `curl`。如果没有：
 
 ```bash
 apt-get update && apt-get install -y curl
@@ -66,7 +84,7 @@ apt-get update && apt-get install -y curl
 
 ### 第一步：启动并粘贴链接
 
-在 root shell 中运行：
+Windows 在普通 PowerShell、CMD 或 Windows Terminal 中运行；Debian 在 root shell 中运行：
 
 ```bash
 dw
@@ -79,7 +97,7 @@ dw
 请粘贴下载链接：https://example.com/video
 ```
 
-程序会先检查依赖更新，显示是否检测到 `/root/cookies.txt`，再读取链接。普通单视频会直接进入格式选择；播放列表会先让你选择要处理的项目；直播会先询问是否录制。
+程序会先检查依赖更新，显示是否检测到当前平台的 `cookies.txt`，再读取链接。普通单视频会直接进入格式选择；播放列表会先让你选择要处理的项目；直播会先询问是否录制。
 
 ### 第二步：选择视频版本
 
@@ -139,7 +157,7 @@ dw
 请选择图片编号（多个用逗号，全部输入 a）：1,3
 ```
 
-选中的图片会转换为 PNG，并与视频一起作为独立文件保存到 `/root`。
+选中的图片会转换为 PNG，并与视频一起作为独立文件保存到当前平台的成品目录。
 
 ### 第六步：等待完成并查看结果
 
@@ -153,6 +171,11 @@ dw
 典型输出位置：
 
 ```text
+# Windows
+C:\Users\你的用户名\Downloads\视频标题.mkv
+C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
+
+# Debian
 /root/视频标题.mkv
 /root/视频标题_thumbnail_1_1920x1080.png
 ```
@@ -179,7 +202,7 @@ dw
 下面仅演示输入顺序：选择第 2 个视频、不使用自带音频、选择第 1 和第 3 条音轨、保存为 MKV、下载全部图片，完成后不继续下一个链接。
 
 ```text
-root@debian:~# dw
+dw
 请选择：1
 请粘贴下载链接：https://example.com/video
 请选择一个视频编号：2
@@ -205,7 +228,16 @@ root@debian:~# dw
 
 ### 使用 Cookies 下载登录内容
 
-在运行 `dw` 前，将 Netscape 格式的 cookies 文件保存为固定路径，并限制权限：
+在运行 `dw` 前，将 Netscape 格式的 cookies 文件保存到当前平台的固定路径。
+
+Windows PowerShell：
+
+```powershell
+Copy-Item 'D:\你的路径\cookies.txt' "$env:USERPROFILE\cookies.txt"
+dw
+```
+
+Debian：
 
 ```bash
 cp /你的路径/cookies.txt /root/cookies.txt
@@ -213,30 +245,31 @@ chmod 600 /root/cookies.txt
 dw
 ```
 
-程序显示 `已发现并启用 cookies` 才表示本次已经使用该文件。cookies 等同于登录凭据，请勿上传到 GitHub 或发送给其他人。
+程序显示 `已发现并启用 cookies` 才表示本次已经使用该文件。Cookies 等同于登录凭据，请勿上传到 GitHub 或发送给其他人。
 
 ### 更新程序与进入卸载
 
-重新运行“快速安装”中的安装命令即可更新 `dw` 主程序，现有下载清单和设置会保留。需要卸载时运行 `dw`，在主菜单选择 `2`；卸载会进一步要求输入完整确认文字，详细删除范围见下方“安全卸载”。
+重新运行当前平台在“快速安装”中的安装命令即可更新 `dw` 主程序，现有下载清单和设置会保留。需要卸载时运行 `dw`，在主菜单选择 `2`；卸载会进一步要求输入完整确认文字，详细删除范围见下方“安全卸载”。
 
 > **卸载警告：** 完整确认卸载后，程序会删除清单中由 `dw` 下载且仍在原路径的全部视频和图片，而不只是删除脚本本身。需要保留的文件请先手动移动或改名，并仔细阅读下方“安全卸载”。
 
 ## 运行条件
 
-- Debian 12 或 Debian 13
-- `x86_64/amd64` CPU
-- `root` 用户
-- 能访问 GitHub 与目标视频网站的网络
-- 终端使用 UTF-8（Debian 默认环境即可）
+| 平台 | 系统与权限 | CPU | 引导环境 |
+|---|---|---|---|
+| Windows | Windows 10/11，当前用户安装，无需管理员 | x64/amd64 | Windows PowerShell 5.1+ |
+| Debian | Debian 12/13，仅限 `root` | x86_64/amd64 | Bash、APT，安装命令需要 `curl` |
+
+两个平台都需要能访问 GitHub、依赖发布站点和目标视频网站。
 
 安装器会自动完成以下工作：
 
-- 检查 Debian 版本、CPU 架构和 `root` 权限；
-- 在缺失时通过 APT 安装最小引导依赖（Python 3、CA 证书）；
-- 将程序安装到 `/opt/dw`；
+- 检查系统版本和 CPU 架构；Debian 额外检查 `root` 权限；
+- Windows 安装经过固定 SHA-256 校验的官方嵌入式 Python，不使用系统 Python；
+- Debian 在缺失时通过 APT 安装最小引导依赖（Python 3、CA 证书）；
 - 安装并校验 yt-dlp nightly、Deno、FFmpeg 和 FFprobe 的官方发布文件；
-- 将缓存和状态隔离在 `/var/lib/dw`；
-- 创建 `/usr/local/bin/dw` 命令。
+- 将应用、便携依赖、缓存、任务和清单放在平台专用目录；
+- 创建 `dw` 命令；Windows 只修改当前用户 PATH，Debian 创建 `/usr/local/bin/dw`。
 
 下载的发布文件都要通过发布方提供的 SHA-256 校验后才会替换现有组件。更新失败但旧组件仍可使用时，`dw` 会明确警告并继续使用旧版本。
 
@@ -354,11 +387,12 @@ a          # 全部
 
 需要登录、会员权限或年龄验证的网站，可将 Netscape 格式的 cookies 文件放在：
 
-```text
-/root/cookies.txt
-```
+| 平台 | 固定路径 |
+|---|---|
+| Windows | `%USERPROFILE%\cookies.txt` |
+| Debian | `/root/cookies.txt` |
 
-建议限制权限：
+Debian 建议限制权限：
 
 ```bash
 chmod 600 /root/cookies.txt
@@ -379,9 +413,15 @@ chmod 600 /root/cookies.txt
 
 ## 文件名与输出位置
 
-所有成品直接保存到 `/root`，不创建视频子目录。
+成品不创建视频子目录。Windows 使用当前用户的 Downloads 已知文件夹（包括 OneDrive 等重定向位置），Debian 使用 `/root`。
 
 ```text
+# Windows
+C:\Users\你的用户名\Downloads\视频标题.mp4
+C:\Users\你的用户名\Downloads\视频标题 (1).mp4
+C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
+
+# Debian
 /root/视频标题.mp4
 /root/视频标题 (1).mp4
 /root/视频标题_thumbnail_1_1920x1080.png
@@ -389,6 +429,7 @@ chmod 600 /root/cookies.txt
 
 - 保留中文、日文及其他 Unicode 字符；
 - 替换路径分隔符、控制字符和不安全字符；
+- Windows 自动处理 `CON`、`NUL`、`COM1`、`LPT1` 等保留设备名；
 - 自动缩短过长文件名；
 - 同名文件使用 `(1)`、`(2)` 依次改名，从不覆盖已有文件。
 
@@ -396,7 +437,7 @@ chmod 600 /root/cookies.txt
 
 ## 失败、取消与事务清理
 
-每个项目先在 `/var/lib/dw/tasks` 的独立临时目录完成下载、合并、音轨整理、媒体校验和 PNG 转换。全部成功后才移动到 `/root`。
+每个项目先在专用任务目录完成下载、合并、音轨整理、媒体校验和 PNG 转换，全部成功后才移动到成品目录。Windows 任务目录位于 `%LOCALAPPDATA%\yt-dlp-dw-data\tasks`，Debian 位于 `/var/lib/dw/tasks`。
 
 - 单视频失败：清理该任务的全部临时文件并显示原因；
 - 播放列表单项失败：清理该项，记录原因并继续；
@@ -418,7 +459,7 @@ chmod 600 /root/cookies.txt
 
 ## 安全卸载
 
-输入 `dw`，选择 `2. 卸载 dw`。卸载前会显示下载文件数量、总大小、应用目录、状态目录及由 `dw` 新安装的 Debian 软件包。
+输入 `dw`，选择 `2. 卸载 dw`。卸载前会显示下载文件数量、总大小、应用目录和状态目录；Debian 还会显示确认由 `dw` 新安装的软件包。
 
 必须完整输入：
 
@@ -431,16 +472,32 @@ chmod 600 /root/cookies.txt
 - 删除清单中由 `dw` 创建且仍位于原路径的全部视频和图片；
 - 使用设备号和 inode 检查文件是否已被替换，避免误删同名新文件；
 - 不搜索或删除用户手动移动、改名的文件；
-- 删除 `/opt/dw`、`/var/lib/dw` 和 `/usr/local/bin/dw`；
-- 移除安装前不存在、确认由安装器新增的 Debian 软件包；
-- 不执行全局 `apt autoremove`，不清理公共 APT 索引、缓存或系统日志；
-- 单独询问是否删除 `/root/cookies.txt`，默认保留；
+- Windows 删除 `%LOCALAPPDATA%\yt-dlp-dw`、`%LOCALAPPDATA%\yt-dlp-dw-data` 和当前用户 PATH 项；
+- Debian 删除 `/opt/dw`、`/var/lib/dw`、`/usr/local/bin/dw`，并移除安装器确认新增的软件包；
+- Debian 不执行全局 `apt autoremove`，不清理公共 APT 索引、缓存或系统日志；
+- 单独询问是否删除当前平台固定位置的 `cookies.txt`，默认保留；
 - 任何项目删除失败时保留程序和清单以便重试，并逐项显示残留，不会虚报成功；
 - 成功卸载后不留下卸载日志。
 
 手动移动或改名的下载文件无法被安全追踪，需要用户自行删除。断电、磁盘故障或强制杀死卸载进程也可能导致部分清理未完成。
 
 ## 安装目录
+
+### Windows
+
+| 路径 | 用途 |
+|---|---|
+| `%LOCALAPPDATA%\yt-dlp-dw\dw.py` | 主程序 |
+| `%LOCALAPPDATA%\yt-dlp-dw\python\` | 隔离的官方嵌入式 Python |
+| `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe |
+| `%LOCALAPPDATA%\yt-dlp-dw\command\dw.cmd` | 命令入口，加入当前用户 PATH |
+| `%LOCALAPPDATA%\yt-dlp-dw-data\cache\` | 专用缓存 |
+| `%LOCALAPPDATA%\yt-dlp-dw-data\tasks\` | 下载事务临时目录 |
+| `%LOCALAPPDATA%\yt-dlp-dw-data\downloads.json` | 卸载使用的下载文件清单 |
+| `%USERPROFILE%\Downloads\` | 默认成品位置，可能被 Windows 重定向 |
+| `%USERPROFILE%\cookies.txt` | 用户可选提供的 Cookies |
+
+### Debian
 
 | 路径 | 用途 |
 |---|---|
@@ -465,11 +522,11 @@ chmod 600 /root/cookies.txt
 
 ### 网站突然不能下载怎么办？
 
-先再次运行 `dw`，依赖检查到期后会更新 yt-dlp nightly。若仍失败，查看程序保留的 yt-dlp 实际错误；登录内容同时检查 `/root/cookies.txt`。
+先再次运行 `dw`，依赖检查到期后会更新 yt-dlp nightly。若仍失败，查看程序保留的 yt-dlp 实际错误；登录内容同时检查 Windows 的 `%USERPROFILE%\cookies.txt` 或 Debian 的 `/root/cookies.txt`。
 
 ### 为什么卸载没有删除我移动过的视频？
 
-安全清单只记录原始路径。主动扫描整个 `/root` 或其他目录可能误删用户文件，因此程序不会尝试猜测移动后的文件位置。
+安全清单只记录原始路径。主动扫描 Downloads、`/root` 或其他目录可能误删用户文件，因此程序不会尝试猜测移动后的文件位置。
 
 ## 开发与验证
 
@@ -481,12 +538,13 @@ python3 -m unittest discover -s tests -v
 bash -n install.sh
 ```
 
-GitHub Actions 会在 Python 3.11（Debian 12 同代）和 Python 3.13（Debian 13 同代）上执行单元测试，并检查 Bash 安装器语法。
+GitHub Actions 会分别在 Ubuntu 和 Windows 上使用 Python 3.11、3.13 执行单元测试，并检查 Bash 与 PowerShell 安装器语法。
 
 ## 上游项目与许可证
 
 - [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds)
 - [denoland/deno](https://github.com/denoland/deno)
+- [Python](https://www.python.org/)
 
 本仓库代码使用 MIT License。安装器下载的第三方程序分别遵循各自许可证；FFmpeg 构建的具体许可信息以其发布包为准。

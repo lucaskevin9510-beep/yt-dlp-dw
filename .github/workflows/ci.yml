@@ -35,3 +35,38 @@ jobs:
         run: bash -n install.sh
       - name: ShellCheck
         run: shellcheck install.sh
+
+  windows-tests:
+    name: Windows Python ${{ matrix.python-version }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python -m py_compile src/dw.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: PowerShell syntax
+        shell: powershell
+        run: |
+          $allErrors = @()
+          foreach ($path in @('install-windows.ps1', 'windows/uninstall-cleanup.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $path),
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            $allErrors += $errors
+          }
+          if ($allErrors.Count -gt 0) {
+            $allErrors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }

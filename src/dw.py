@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dw - interactive yt-dlp download assistant for Debian 12/13.
+"""dw - interactive yt-dlp download assistant for Debian and Windows.
 
 The application intentionally delegates extraction/downloading to the official
 yt-dlp executable and media muxing/validation to FFmpeg.  It never evaluates
@@ -13,9 +13,11 @@ import contextlib
 import dataclasses
 import errno
 import hashlib
+import http.client
 import http.cookiejar
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -40,19 +42,59 @@ try:
 except ImportError:  # pragma: no cover - allows unit tests to import on Windows
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - unavailable on POSIX
+    msvcrt = None
 
-APP_VERSION = "1.0.0"
-APP_DIR = Path(os.environ.get("DW_APP_DIR", "/opt/dw"))
-STATE_DIR = Path(os.environ.get("DW_STATE_DIR", "/var/lib/dw"))
-OUTPUT_DIR = Path(os.environ.get("DW_OUTPUT_DIR", "/root"))
-COOKIE_FILE = Path(os.environ.get("DW_COOKIE_FILE", "/root/cookies.txt"))
-LAUNCHER_PATH = Path(os.environ.get("DW_LAUNCHER_PATH", "/usr/local/bin/dw"))
+
+APP_VERSION = "1.1.0"
+IS_WINDOWS = os.name == "nt"
+
+
+def windows_downloads_directory() -> Path:
+    """Resolve the current user's redirected Windows Downloads known folder."""
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    if not IS_WINDOWS:
+        return home / "Downloads"
+    try:
+        import winreg
+
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        value_name = "{374DE290-123F-4565-9164-39C4925E467B}"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _value_type = winreg.QueryValueEx(key, value_name)
+        resolved = Path(os.path.expandvars(str(value)))
+        if resolved.is_absolute():
+            return resolved
+    except (ImportError, OSError, TypeError, ValueError):
+        pass
+    return home / "Downloads"
+
+
+if IS_WINDOWS:
+    _USER_HOME = Path(os.environ.get("USERPROFILE") or Path.home())
+    _LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA") or (_USER_HOME / "AppData" / "Local"))
+    APP_DIR = Path(os.environ.get("DW_APP_DIR", str(_LOCAL_APP_DATA / "yt-dlp-dw")))
+    STATE_DIR = Path(os.environ.get("DW_STATE_DIR", str(_LOCAL_APP_DATA / "yt-dlp-dw-data")))
+    OUTPUT_DIR = Path(os.environ.get("DW_OUTPUT_DIR", str(windows_downloads_directory())))
+    COOKIE_FILE = Path(os.environ.get("DW_COOKIE_FILE", str(_USER_HOME / "cookies.txt")))
+    COMMAND_DIR = Path(os.environ.get("DW_COMMAND_DIR", str(APP_DIR / "command")))
+    LAUNCHER_PATH = Path(os.environ.get("DW_LAUNCHER_PATH", str(COMMAND_DIR / "dw.cmd")))
+else:
+    APP_DIR = Path(os.environ.get("DW_APP_DIR", "/opt/dw"))
+    STATE_DIR = Path(os.environ.get("DW_STATE_DIR", "/var/lib/dw"))
+    OUTPUT_DIR = Path(os.environ.get("DW_OUTPUT_DIR", "/root"))
+    COOKIE_FILE = Path(os.environ.get("DW_COOKIE_FILE", "/root/cookies.txt"))
+    LAUNCHER_PATH = Path(os.environ.get("DW_LAUNCHER_PATH", "/usr/local/bin/dw"))
+    COMMAND_DIR = LAUNCHER_PATH.parent
 
 BIN_DIR = APP_DIR / "bin"
-YT_DLP = BIN_DIR / "yt-dlp"
-DENO = BIN_DIR / "deno"
-FFMPEG = BIN_DIR / "ffmpeg"
-FFPROBE = BIN_DIR / "ffprobe"
+_EXECUTABLE_SUFFIX = ".exe" if IS_WINDOWS else ""
+YT_DLP = BIN_DIR / f"yt-dlp{_EXECUTABLE_SUFFIX}"
+DENO = BIN_DIR / f"deno{_EXECUTABLE_SUFFIX}"
+FFMPEG = BIN_DIR / f"ffmpeg{_EXECUTABLE_SUFFIX}"
+FFPROBE = BIN_DIR / f"ffprobe{_EXECUTABLE_SUFFIX}"
 CACHE_DIR = STATE_DIR / "cache"
 TASKS_DIR = STATE_DIR / "tasks"
 COMPONENTS_FILE = STATE_DIR / "components.json"
@@ -61,6 +103,7 @@ PACKAGES_FILE = STATE_DIR / "managed-packages.json"
 LOCK_FILE = STATE_DIR / "dw.lock"
 APP_MARKER = APP_DIR / ".dw-owned"
 STATE_MARKER = STATE_DIR / ".dw-owned"
+WINDOWS_UNINSTALL_HELPER = APP_DIR / "uninstall-windows.ps1"
 
 GITHUB_API = "https://api.github.com/repos"
 USER_AGENT = f"yt-dlp-dw/{APP_VERSION} (+https://github.com/lucaskevin9510-beep/yt-dlp-dw)"
@@ -70,6 +113,16 @@ UNINSTALL_CONFIRMATION = "确认卸载并删除全部下载"
 
 VIDEO_CONTAINER_ORDER = {"mp4": 0, "webm": 1}
 SUPPORTED_REMUX_CONTAINERS = {"avi", "flv", "mkv", "mov", "mp4", "webm"}
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "CONIN$",
+    "CONOUT$",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 
 
 class DwError(RuntimeError):
@@ -183,11 +236,23 @@ class InstanceLock:
 
     def __enter__(self) -> "InstanceLock":
         ensure_runtime_directories()
-        self._handle = LOCK_FILE.open("a+", encoding="utf-8")
+        self._handle = LOCK_FILE.open("a+b")
+        self._handle.seek(0, os.SEEK_END)
+        if self._handle.tell() == 0:
+            self._handle.write(b"\0")
+            self._handle.flush()
+        self._handle.seek(0)
         if fcntl is not None:
             try:
                 fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
+                raise DwError("已有另一个 dw 实例正在运行，请等待它结束。") from exc
+        elif msvcrt is not None:
+            try:
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                self._handle.close()
+                self._handle = None
                 raise DwError("已有另一个 dw 实例正在运行，请等待它结束。") from exc
         return self
 
@@ -196,6 +261,10 @@ class InstanceLock:
             if fcntl is not None:
                 with contextlib.suppress(OSError):
                     fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                with contextlib.suppress(OSError):
+                    self._handle.seek(0)
+                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
             self._handle.close()
 
 
@@ -207,20 +276,33 @@ def request(url: str) -> urllib.request.Request:
 
 
 def fetch_json(url: str) -> dict[str, Any]:
-    try:
-        with urllib.request.urlopen(request(url), timeout=45) as response:
-            return json.load(response)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise DwError("无法查询依赖版本。", str(exc)) from exc
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request(url), timeout=45) as response:
+                return json.load(response)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.HTTPException) as exc:
+            last_error = exc
+            if attempt < 3:
+                warn(f"查询依赖版本失败，第 {attempt}/3 次重试 …")
+                time.sleep(attempt)
+    raise DwError("无法查询依赖版本。", str(last_error)) from last_error
 
 
 def download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with urllib.request.urlopen(request(url), timeout=90) as response, destination.open("wb") as out:
-            shutil.copyfileobj(response, out, length=1024 * 1024)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise DwError(f"下载依赖失败：{url}", str(exc)) from exc
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request(url), timeout=90) as response, destination.open("wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
+            return
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+            last_error = exc
+            if attempt < 3:
+                warn(f"依赖下载失败，第 {attempt}/3 次重试 …")
+                time.sleep(attempt)
+    raise DwError(f"下载依赖失败：{url}", str(last_error)) from last_error
 
 
 def sha256_file(path: Path) -> str:
@@ -232,6 +314,19 @@ def sha256_file(path: Path) -> str:
 
 
 def expected_checksum(checksum_text: str, asset_name: str) -> str:
+    algorithm_match = re.search(r"(?im)^\s*Algorithm\s*:\s*([A-Za-z0-9-]+)\s*$", checksum_text)
+    hash_match = re.search(r"(?im)^\s*Hash\s*:\s*([0-9a-f]{64})\s*$", checksum_text)
+    path_match = re.search(r"(?im)^\s*Path\s*:\s*(.+?)\s*$", checksum_text)
+    if algorithm_match or hash_match or path_match:
+        if not algorithm_match or algorithm_match.group(1).replace("-", "").upper() != "SHA256":
+            raise DwError(f"{asset_name} 的校验文件算法不是 SHA-256。")
+        if not hash_match:
+            raise DwError(f"{asset_name} 的校验文件缺少 SHA-256。")
+        if path_match:
+            named = re.split(r"[\\/]", path_match.group(1).strip())[-1]
+            if named.lower() != asset_name.lower():
+                raise DwError(f"校验文件对应 {named}，不是预期的 {asset_name}。")
+        return hash_match.group(1).lower()
     for line in checksum_text.splitlines():
         fields = line.strip().split()
         if not fields:
@@ -277,12 +372,29 @@ def atomic_install_binary(source: Path, destination: Path) -> None:
     os.replace(temp, destination)
 
 
+def ytdlp_asset_name() -> str:
+    return "yt-dlp.exe" if IS_WINDOWS else "yt-dlp_linux"
+
+
+def deno_asset_layout() -> tuple[str, str]:
+    if IS_WINDOWS:
+        return "deno-x86_64-pc-windows-msvc.zip", "deno.exe"
+    return "deno-x86_64-unknown-linux-gnu.zip", "deno"
+
+
+def ffmpeg_asset_layout() -> tuple[str, set[str]]:
+    if IS_WINDOWS:
+        return "ffmpeg-master-latest-win64-gpl.zip", {"ffmpeg.exe", "ffprobe.exe"}
+    return "ffmpeg-master-latest-linux64-gpl.tar.xz", {"ffmpeg", "ffprobe"}
+
+
 def install_ytdlp(metadata: dict[str, Any], workdir: Path, force: bool) -> None:
     release, assets = release_info("yt-dlp/yt-dlp-nightly-builds")
     version = str(release.get("tag_name") or release.get("name") or "unknown")
     if not force and metadata.get("yt-dlp") == version and YT_DLP.is_file():
         return
-    asset = verified_asset(assets, "yt-dlp_linux", "SHA2-256SUMS", workdir)
+    asset_name = ytdlp_asset_name()
+    asset = verified_asset(assets, asset_name, "SHA2-256SUMS", workdir)
     atomic_install_binary(asset, YT_DLP)
     metadata["yt-dlp"] = version
     info(f"  yt-dlp 已更新至 nightly {version}")
@@ -293,11 +405,11 @@ def install_deno(metadata: dict[str, Any], workdir: Path, force: bool) -> None:
     version = str(release.get("tag_name") or "unknown")
     if not force and metadata.get("deno") == version and DENO.is_file():
         return
-    name = "deno-x86_64-unknown-linux-gnu.zip"
+    name, executable_name = deno_asset_layout()
     archive = verified_asset(assets, name, f"{name}.sha256sum", workdir)
     extracted = workdir / "deno-extracted"
     with zipfile.ZipFile(archive) as bundle:
-        member = next((item for item in bundle.infolist() if Path(item.filename).name == "deno"), None)
+        member = next((item for item in bundle.infolist() if Path(item.filename).name == executable_name), None)
         if member is None or member.is_dir():
             raise DwError("Deno 压缩包中找不到 deno 可执行文件。")
         with bundle.open(member) as source, extracted.open("wb") as target:
@@ -309,35 +421,50 @@ def install_deno(metadata: dict[str, Any], workdir: Path, force: bool) -> None:
 
 def install_ffmpeg(metadata: dict[str, Any], workdir: Path, force: bool) -> None:
     release, assets = release_info("yt-dlp/FFmpeg-Builds")
-    name = "ffmpeg-master-latest-linux64-gpl.tar.xz"
+    name, expected_names = ffmpeg_asset_layout()
     asset_meta = assets.get(name, {})
     version = str(asset_meta.get("updated_at") or release.get("published_at") or "unknown")
     if not force and metadata.get("ffmpeg") == version and FFMPEG.is_file() and FFPROBE.is_file():
         return
     archive = verified_asset(assets, name, "checksums.sha256", workdir)
     extracted: dict[str, Path] = {}
-    with tarfile.open(archive, "r:xz") as bundle:
-        for member in bundle.getmembers():
-            basename = Path(member.name).name
-            if basename not in {"ffmpeg", "ffprobe"} or not member.isfile() or "/bin/" not in member.name:
-                continue
-            source = bundle.extractfile(member)
-            if source is None:
-                continue
-            target = workdir / f"{basename}-extracted"
-            with source, target.open("wb") as out:
-                shutil.copyfileobj(source, out)
-            extracted[basename] = target
-    if set(extracted) != {"ffmpeg", "ffprobe"}:
+    if IS_WINDOWS:
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                basename = Path(member.filename).name
+                normalized = member.filename.replace("\\", "/")
+                if basename not in expected_names or member.is_dir() or "/bin/" not in normalized:
+                    continue
+                target = workdir / f"{basename}-extracted"
+                with bundle.open(member) as source, target.open("wb") as out:
+                    shutil.copyfileobj(source, out)
+                extracted[basename] = target
+    else:
+        with tarfile.open(archive, "r:xz") as bundle:
+            for member in bundle.getmembers():
+                basename = Path(member.name).name
+                if basename not in expected_names or not member.isfile() or "/bin/" not in member.name:
+                    continue
+                source = bundle.extractfile(member)
+                if source is None:
+                    continue
+                target = workdir / f"{basename}-extracted"
+                with source, target.open("wb") as out:
+                    shutil.copyfileobj(source, out)
+                extracted[basename] = target
+    if set(extracted) != expected_names:
         raise DwError("FFmpeg 压缩包结构异常，未安装任何不完整组件。")
-    atomic_install_binary(extracted["ffmpeg"], FFMPEG)
-    atomic_install_binary(extracted["ffprobe"], FFPROBE)
+    atomic_install_binary(extracted[FFMPEG.name], FFMPEG)
+    atomic_install_binary(extracted[FFPROBE.name], FFPROBE)
     metadata["ffmpeg"] = version
     info("  FFmpeg/FFprobe 已更新")
 
 
 def dependencies_present() -> bool:
-    return all(path.is_file() and os.access(path, os.X_OK) for path in (YT_DLP, DENO, FFMPEG, FFPROBE))
+    return all(
+        path.is_file() and (IS_WINDOWS or os.access(path, os.X_OK))
+        for path in (YT_DLP, DENO, FFMPEG, FFPROBE)
+    )
 
 
 def install_or_update_dependencies(force: bool = False) -> None:
@@ -381,8 +508,11 @@ def install_or_update_dependencies(force: bool = False) -> None:
 def ytdlp_environment() -> dict[str, str]:
     env = os.environ.copy()
     env["DENO_DIR"] = str(CACHE_DIR / "deno")
-    env.setdefault("LC_ALL", "C.UTF-8")
-    env.setdefault("LANG", "C.UTF-8")
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    if not IS_WINDOWS:
+        env.setdefault("LC_ALL", "C.UTF-8")
+        env.setdefault("LANG", "C.UTF-8")
     return env
 
 
@@ -1123,6 +1253,8 @@ def sanitize_filename(title: str, max_bytes: int = 180) -> str:
     title = re.sub(r"\s+", " ", title).strip(" .")
     if title in {"", ".", ".."}:
         title = "未命名视频"
+    if title.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        title = f"_{title}"
     encoded = title.encode("utf-8")
     if len(encoded) <= max_bytes:
         return title
@@ -1183,6 +1315,52 @@ def process_stderr(stream: Any, buffer: list[str]) -> None:
     stream.close()
 
 
+def process_group_options(live: bool) -> dict[str, Any]:
+    if not live:
+        return {}
+    if IS_WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+def signal_download_process(process: subprocess.Popen[Any], grouped: bool, force: bool) -> None:
+    """Stop yt-dlp and its FFmpeg child without invoking a shell."""
+    if process.poll() is not None:
+        return
+    if IS_WINDOWS:
+        if force:
+            try:
+                subprocess.run(
+                    ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                with contextlib.suppress(OSError):
+                    process.kill()
+            return
+        if grouped and hasattr(signal, "CTRL_BREAK_EVENT"):
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                return
+            except OSError:
+                pass
+        with contextlib.suppress(OSError):
+            process.terminate()
+        return
+    if grouped:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGINT)
+    elif force:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+
+
 def run_download_process(args: list[str], live: bool) -> ProcessResult:
     stderr_lines: list[str] = []
     try:
@@ -1194,7 +1372,7 @@ def run_download_process(args: list[str], live: bool) -> ProcessResult:
             encoding="utf-8",
             errors="replace",
             env=ytdlp_environment(),
-            start_new_session=live,
+            **process_group_options(live),
         )
     except OSError as exc:
         raise DwError("无法启动下载进程。", str(exc)) from exc
@@ -1202,16 +1380,15 @@ def run_download_process(args: list[str], live: bool) -> ProcessResult:
     reader = threading.Thread(target=process_stderr, args=(process.stderr, stderr_lines), daemon=True)
     reader.start()
 
-    if not live or os.name != "posix":
+    if not live:
         try:
             returncode = process.wait()
         except KeyboardInterrupt as exc:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
+            signal_download_process(process, grouped=False, force=False)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=5)
             if process.poll() is None:
-                process.kill()
+                signal_download_process(process, grouped=False, force=True)
             raise DownloadAborted from exc
         finally:
             reader.join(timeout=2)
@@ -1227,13 +1404,11 @@ def run_download_process(args: list[str], live: bool) -> ProcessResult:
         if not first_interrupt:
             first_interrupt = now
             info("\n正在停止直播录制并封装文件；5 秒内再次按 Ctrl+C 将删除本次任务 …")
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGINT)
+            signal_download_process(process, grouped=True, force=False)
             return
         if now - first_interrupt <= 5:
             abort_requested = True
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+            signal_download_process(process, grouped=True, force=True)
 
     signal.signal(signal.SIGINT, live_interrupt)
     try:
@@ -1247,8 +1422,7 @@ def run_download_process(args: list[str], live: bool) -> ProcessResult:
     finally:
         signal.signal(signal.SIGINT, old_handler)
         if process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+            signal_download_process(process, grouped=True, force=True)
         reader.join(timeout=2)
 
 
@@ -1860,6 +2034,55 @@ def launcher_is_owned() -> bool:
         return False
 
 
+def windows_cleanup_helper_is_owned() -> bool:
+    try:
+        return "dw-managed-windows-cleanup" in WINDOWS_UNINSTALL_HELPER.read_text(
+            encoding="utf-8", errors="ignore"
+        )[:512]
+    except OSError:
+        return False
+
+
+def schedule_windows_cleanup() -> str | None:
+    if not windows_cleanup_helper_is_owned():
+        return f"Windows 卸载清理器缺失或不属于 dw：{WINDOWS_UNINSTALL_HELPER}"
+    powershell = shutil.which("powershell.exe") or str(
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    command = [
+        powershell,
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(WINDOWS_UNINSTALL_HELPER),
+        "-ParentPid",
+        str(os.getpid()),
+        "-AppDir",
+        str(APP_DIR),
+        "-StateDir",
+        str(STATE_DIR),
+        "-CommandDir",
+        str(COMMAND_DIR),
+    ]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except OSError as exc:
+        return f"无法启动 Windows 卸载清理器：{exc}"
+    return None
+
+
 def uninstall() -> None:
     manifest = read_json(MANIFEST_FILE, {"files": []})
     entries = [entry for entry in manifest.get("files", []) if isinstance(entry, dict)]
@@ -1875,7 +2098,7 @@ def uninstall() -> None:
     download_size = sum(path.lstat().st_size for path in deletable)
     app_count, app_size = tree_stats(APP_DIR)
     state_count, state_size = tree_stats(STATE_DIR)
-    packages = read_json(PACKAGES_FILE, [])
+    packages = [] if IS_WINDOWS else read_json(PACKAGES_FILE, [])
     packages = [str(package) for package in packages if isinstance(package, str)]
 
     info("\n卸载将处理以下内容：")
@@ -1885,7 +2108,9 @@ def uninstall() -> None:
     info(f"- 应用目录：{APP_DIR}（{app_count} 个文件，{format_size(app_size)}）")
     info(f"- 状态与缓存：{STATE_DIR}（{state_count} 个文件，{format_size(state_size)}）")
     info(f"- 命令入口：{LAUNCHER_PATH}")
-    if packages:
+    if IS_WINDOWS:
+        info("- Windows 版使用隔离的便携依赖，不修改系统软件包")
+    elif packages:
         info("- 由 dw 安装的 Debian 软件包：" + "、".join(packages))
     else:
         info("- 没有记录需要移除的 Debian 软件包")
@@ -1910,7 +2135,7 @@ def uninstall() -> None:
         except OSError as exc:
             failures.append(f"{COOKIE_FILE}：{exc}")
 
-    if packages:
+    if packages and not IS_WINDOWS:
         result = subprocess.run(
             ["apt-get", "purge", "-y", *packages],
             text=True,
@@ -1930,6 +2155,22 @@ def uninstall() -> None:
         error("卸载未完全完成。以下内容需要处理后再次选择卸载：")
         for failure in failures:
             error(failure)
+        return
+
+    if IS_WINDOWS:
+        cleanup_failure = schedule_windows_cleanup()
+        if cleanup_failure:
+            failures.append(cleanup_failure)
+            residual = {"failed_at": int(time.time()), "items": failures}
+            with contextlib.suppress(OSError):
+                write_json_atomic(STATE_DIR / "uninstall-residuals.json", residual)
+            error("Windows 卸载清理器未能启动，以下内容仍然保留：")
+            for failure in failures:
+                error(failure)
+            return
+        info("下载文件已删除；dw 退出后将继续删除命令、便携依赖、缓存和状态目录。")
+        if not delete_cookie and cookie_path_present():
+            info(f"已按你的选择保留：{COOKIE_FILE}")
         return
 
     if LAUNCHER_PATH.exists() or LAUNCHER_PATH.is_symlink():
@@ -1971,8 +2212,22 @@ def recover_abandoned_tasks() -> None:
 
 
 def require_root_and_platform() -> None:
+    if IS_WINDOWS:
+        version = sys.getwindowsversion()
+        if version.major != 10:
+            raise DwError(
+                f"不支持的 Windows 版本：{platform.platform()}；当前仅支持 Windows 10/11。"
+            )
+        machine = (
+            os.environ.get("PROCESSOR_ARCHITEW6432")
+            or os.environ.get("PROCESSOR_ARCHITECTURE")
+            or platform.machine()
+        ).lower()
+        if machine not in {"amd64", "x86_64"}:
+            raise DwError(f"不支持的 CPU 架构：{machine}；Windows 版当前仅支持 x64/amd64。")
+        return
     if os.name != "posix" or not hasattr(os, "geteuid"):
-        raise DwError("dw 只能在 Debian 12/13 Linux 系统运行。")
+        raise DwError("dw 当前仅支持 Debian 12/13 或 Windows 10/11。")
     if os.geteuid() != 0:
         raise DwError("dw 仅供 root 用户运行，请切换到 root 后重试。")
     machine = os.uname().machine.lower()
@@ -2034,7 +2289,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def configure_console() -> None:
+    if not IS_WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(OSError, ValueError):
+                reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_console()
     args = parse_args(argv)
     try:
         require_root_and_platform()

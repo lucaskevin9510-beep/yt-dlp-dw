@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -221,6 +223,96 @@ class InteractiveFlowTests(unittest.TestCase):
         self.assertEqual(selection.resolved_container, "mp4")
 
 
+class PlatformSupportTests(unittest.TestCase):
+    def test_dependency_http_query_retries_transient_failure(self) -> None:
+        response = io.StringIO('{"ok": true}')
+        with mock.patch.object(
+            dw.urllib.request,
+            "urlopen",
+            side_effect=[urllib.error.URLError("temporary TLS failure"), response],
+        ) as urlopen, mock.patch.object(dw.time, "sleep") as sleep:
+            self.assertEqual(dw.fetch_json("https://example.test/release"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_dependency_asset_layouts(self) -> None:
+        with mock.patch.object(dw, "IS_WINDOWS", True):
+            self.assertEqual(dw.ytdlp_asset_name(), "yt-dlp.exe")
+            self.assertEqual(
+                dw.deno_asset_layout(),
+                ("deno-x86_64-pc-windows-msvc.zip", "deno.exe"),
+            )
+            self.assertEqual(
+                dw.ffmpeg_asset_layout(),
+                ("ffmpeg-master-latest-win64-gpl.zip", {"ffmpeg.exe", "ffprobe.exe"}),
+            )
+        with mock.patch.object(dw, "IS_WINDOWS", False):
+            self.assertEqual(dw.ytdlp_asset_name(), "yt-dlp_linux")
+            self.assertEqual(
+                dw.deno_asset_layout(),
+                ("deno-x86_64-unknown-linux-gnu.zip", "deno"),
+            )
+
+    def test_process_group_options_are_platform_specific(self) -> None:
+        with mock.patch.object(dw, "IS_WINDOWS", True):
+            self.assertIn("creationflags", dw.process_group_options(True))
+            self.assertNotIn("start_new_session", dw.process_group_options(True))
+        with mock.patch.object(dw, "IS_WINDOWS", False):
+            self.assertEqual(dw.process_group_options(True), {"start_new_session": True})
+        self.assertEqual(dw.process_group_options(False), {})
+
+    def test_forced_windows_stop_uses_taskkill_for_the_process_tree(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.pid = 4321
+        with mock.patch.object(dw, "IS_WINDOWS", True), mock.patch.object(
+            dw.subprocess, "run"
+        ) as run:
+            dw.signal_download_process(process, grouped=True, force=True)
+        self.assertEqual(run.call_args.args[0], ["taskkill.exe", "/PID", "4321", "/T", "/F"])
+
+    def test_instance_lock_rejects_a_second_instance(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+            root = Path(temp)
+            with mock.patch.multiple(
+                dw,
+                STATE_DIR=root,
+                CACHE_DIR=root / "cache",
+                TASKS_DIR=root / "tasks",
+                LOCK_FILE=root / "dw.lock",
+                STATE_MARKER=root / ".dw-owned",
+            ):
+                with dw.InstanceLock():
+                    with self.assertRaises(dw.DwError):
+                        with dw.InstanceLock():
+                            pass
+
+    def test_windows_cleanup_is_started_with_exact_managed_paths(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+            root = Path(temp)
+            app = root / "app"
+            command = app / "command"
+            state = root / "state"
+            helper = app / "uninstall-windows.ps1"
+            app.mkdir()
+            helper.write_text("# dw-managed-windows-cleanup\n", encoding="utf-8")
+            with mock.patch.multiple(
+                dw,
+                APP_DIR=app,
+                STATE_DIR=state,
+                COMMAND_DIR=command,
+                WINDOWS_UNINSTALL_HELPER=helper,
+            ), mock.patch.object(dw.shutil, "which", return_value="powershell.exe"), mock.patch.object(
+                dw.subprocess, "Popen"
+            ) as popen:
+                self.assertIsNone(dw.schedule_windows_cleanup())
+            arguments = popen.call_args.args[0]
+            self.assertEqual(arguments[0], "powershell.exe")
+            self.assertEqual(arguments[arguments.index("-AppDir") + 1], str(app))
+            self.assertEqual(arguments[arguments.index("-StateDir") + 1], str(state))
+            self.assertEqual(arguments[arguments.index("-CommandDir") + 1], str(command))
+
+
 class FilesystemSafetyTests(unittest.TestCase):
     def test_inaccessible_cookie_file_is_treated_as_absent(self) -> None:
         inaccessible = mock.Mock()
@@ -240,10 +332,26 @@ class FilesystemSafetyTests(unittest.TestCase):
         value = dw.sanitize_filename("下载" * 200, max_bytes=30)
         self.assertLessEqual(len(value.encode("utf-8")), 30)
 
+    def test_windows_reserved_device_names_are_prefixed(self) -> None:
+        self.assertEqual(dw.sanitize_filename("CON"), "_CON")
+        self.assertEqual(dw.sanitize_filename("lpt1.txt"), "_lpt1.txt")
+
     def test_checksum_parser_supports_named_and_hash_only_files(self) -> None:
         digest = hashlib.sha256(b"test").hexdigest()
         self.assertEqual(dw.expected_checksum(f"{digest} *asset.zip\n", "asset.zip"), digest)
         self.assertEqual(dw.expected_checksum(f"{digest}\n", "asset.zip"), digest)
+
+    def test_checksum_parser_supports_deno_windows_format(self) -> None:
+        digest = hashlib.sha256(b"deno").hexdigest().upper()
+        content = (
+            "Algorithm : SHA256\r\n"
+            f"Hash      : {digest}\r\n"
+            "Path      : C:\\a\\deno\\target\\release\\deno-x86_64-pc-windows-msvc.zip\r\n"
+        )
+        self.assertEqual(
+            dw.expected_checksum(content, "deno-x86_64-pc-windows-msvc.zip"),
+            digest.lower(),
+        )
 
     def test_manifest_rejects_paths_outside_output_directory(self) -> None:
         old_output = dw.OUTPUT_DIR
