@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import errno
 import hashlib
+import html
 import http.client
 import http.cookiejar
 import json
@@ -48,7 +49,7 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
     msvcrt = None
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 IS_WINDOWS = os.name == "nt"
 
 
@@ -114,6 +115,7 @@ TASKS_DIR = STATE_DIR / "tasks"
 COMPONENTS_FILE = STATE_DIR / "components.json"
 MANIFEST_FILE = STATE_DIR / "downloads.json"
 PACKAGES_FILE = STATE_DIR / "managed-packages.json"
+GITHUB_MIRRORS_FILE = STATE_DIR / "github-mirrors.txt"
 LOCK_FILE = STATE_DIR / "dw.lock"
 APP_MARKER = APP_DIR / ".dw-owned"
 STATE_MARKER = STATE_DIR / ".dw-owned"
@@ -124,6 +126,63 @@ USER_AGENT = f"yt-dlp-dw/{APP_VERSION} (+https://github.com/lucaskevin9510-beep/
 PAGE_SIZE = 30
 UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 UNINSTALL_CONFIRMATION = "确认卸载并删除全部下载"
+
+BUILTIN_GITHUB_MIRRORS = (
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+)
+DOMESTIC_DOMAIN_SUFFIXES = {
+    "163.com",
+    "56.com",
+    "acfun.cn",
+    "amemv.com",
+    "b23.tv",
+    "baidu.com",
+    "bilibili.com",
+    "cctv.com",
+    "douban.com",
+    "douyin.com",
+    "douyu.com",
+    "fun.tv",
+    "huya.com",
+    "ifeng.com",
+    "iesdouyin.com",
+    "iqiyi.com",
+    "ixigua.com",
+    "kuaishou.com",
+    "le.com",
+    "lizhi.fm",
+    "mgtv.com",
+    "netease.com",
+    "pearvideo.com",
+    "pptv.com",
+    "qq.com",
+    "qingting.fm",
+    "rednote.com",
+    "sohu.com",
+    "tudou.com",
+    "v.douyin.com",
+    "weibo.cn",
+    "weibo.com",
+    "xhslink.com",
+    "xiaohongshu.com",
+    "ximalaya.com",
+    "xinpianchang.com",
+    "yizhibo.com",
+    "yinyuetai.com",
+    "youku.com",
+    "zhihu.com",
+}
+COOKIE_RETRY_DOMAIN_SUFFIXES = {
+    "douyin.com",
+    "rednote.com",
+    "xhslink.com",
+    "xiaohongshu.com",
+    "xinpianchang.com",
+}
+URL_END_CHARACTERS = "\t\r\n <>\"'`()[]{}，。！？；、【】（）《》〈〉「」『』〔〕［］"
+_WARNED_CUSTOM_MIRRORS: set[str] = set()
 
 VIDEO_CONTAINER_ORDER = {"mp4": 0, "webm": 1}
 SUPPORTED_REMUX_CONTAINERS = {"avi", "flv", "mkv", "mov", "mp4", "webm"}
@@ -162,6 +221,16 @@ class ProcessResult:
     returncode: int
     stderr: str
     live_stopped: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class RequestPolicy:
+    """Network and cookie choices applied to every yt-dlp call for one URL."""
+
+    direct: bool = False
+    cookie_mode: str = "none"
+    browser: str = "chrome"
+    browser_refresh_attempted: bool = False
 
 
 @dataclasses.dataclass
@@ -244,6 +313,173 @@ def write_json_atomic(path: Path, value: Any, mode: int = 0o600) -> None:
             temp_path.unlink()
 
 
+def hostname_matches(hostname: str, suffixes: Iterable[str]) -> bool:
+    hostname = hostname.lower().rstrip(".")
+    return any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in suffixes)
+
+
+def url_hostname(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def normalize_shared_url(url: str) -> str:
+    """Normalize site share URLs while preserving required query tokens."""
+    url = html.unescape(url.strip())
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if hostname_matches(hostname, {"douyin.com"}):
+        modal_ids = urllib.parse.parse_qs(parsed.query).get("modal_id") or []
+        if modal_ids and re.fullmatch(r"\d+", modal_ids[0]):
+            return f"https://www.douyin.com/video/{modal_ids[0]}"
+    return url
+
+
+def extract_urls_from_text(text: str) -> list[str]:
+    """Extract, clean, normalize, and deduplicate HTTP(S) URLs from share text."""
+    value = html.unescape(text.strip())
+    starts = list(re.finditer(r"https?://", value, flags=re.IGNORECASE))
+    urls: list[str] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for position, match in enumerate(starts):
+        end = starts[position + 1].start() if position + 1 < len(starts) else len(value)
+        segment = value[match.start() : end]
+        stop = next(
+            (
+                index
+                for index, character in enumerate(segment)
+                if character in URL_END_CHARACTERS
+                or (
+                    ord(character) > 127
+                    and unicodedata.category(character) in {"Sk", "So"}
+                )
+            ),
+            len(segment),
+        )
+        candidate = segment[:stop].rstrip(".,;!?:")
+        if not candidate:
+            continue
+        candidate = normalize_shared_url(candidate)
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+        except ValueError:
+            continue
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            continue
+        key = (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/") or "/",
+            parsed.query,
+            parsed.fragment,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(candidate)
+    return urls
+
+
+def is_domestic_url(url: str) -> bool:
+    hostname = url_hostname(url)
+    return bool(hostname) and (hostname.endswith(".cn") or hostname_matches(hostname, DOMESTIC_DOMAIN_SUFFIXES))
+
+
+def browser_cookie_retry_recommended(url: str, detail: str) -> bool:
+    lowered = detail.lower()
+    cookie_markers = (
+        "fresh cookies",
+        "cookies are no longer valid",
+        "cookie file is not valid",
+        "cookies have expired",
+        "login required",
+        "sign in",
+        "authentication required",
+        "not a bot",
+    )
+    if any(marker in lowered for marker in cookie_markers):
+        return True
+    return hostname_matches(url_hostname(url), COOKIE_RETRY_DOMAIN_SUFFIXES) and any(
+        marker in lowered
+        for marker in (
+            "http error 403",
+            "403: forbidden",
+        )
+    )
+
+
+def system_proxy_configured() -> bool:
+    with contextlib.suppress(OSError, ValueError):
+        proxies = urllib.request.getproxies()
+        return any(value for key, value in proxies.items() if key.lower() in {"http", "https", "all"})
+    return False
+
+
+def configured_github_mirrors() -> list[str]:
+    values: list[str] = []
+    environment = os.environ.get("DW_GITHUB_MIRRORS", "")
+    if environment:
+        values.extend(re.split(r"[;,\r\n]+", environment))
+    try:
+        values.extend(GITHUB_MIRRORS_FILE.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        pass
+
+    mirrors: list[str] = []
+    for raw in values:
+        mirror = raw.strip()
+        if not mirror or mirror.startswith("#") or mirror in mirrors:
+            continue
+        probe = mirror.replace("{url}", "https://github.com/")
+        try:
+            parsed = urllib.parse.urlsplit(probe)
+        except ValueError:
+            parsed = urllib.parse.SplitResult("", "", "", "", "")
+        if parsed.scheme != "https" or not parsed.hostname:
+            if mirror not in _WARNED_CUSTOM_MIRRORS:
+                warn(f"你提供的镜像域名不可使用：{mirror}")
+                _WARNED_CUSTOM_MIRRORS.add(mirror)
+            continue
+        mirrors.append(mirror)
+    return mirrors
+
+
+def apply_github_mirror(mirror: str, url: str) -> str:
+    if "{url}" in mirror:
+        return mirror.replace("{url}", url)
+    return f"{mirror.rstrip('/')}/{url}"
+
+
+def github_request_candidates(url: str) -> list[tuple[str, str, bool]]:
+    hostname = url_hostname(url)
+    github_hostnames = {"api.github.com", "github.com", "raw.githubusercontent.com"}
+    if hostname not in github_hostnames:
+        return [(url, "官方源", False)]
+
+    candidates: list[tuple[str, str, bool]] = []
+    for mirror in configured_github_mirrors():
+        candidates.append((apply_github_mirror(mirror, url), mirror, True))
+    candidates.append((url, "GitHub 官方源", False))
+    for mirror in BUILTIN_GITHUB_MIRRORS:
+        if hostname == "api.github.com" and mirror != "https://gh-proxy.com/":
+            continue
+        candidates.append((apply_github_mirror(mirror, url), mirror, False))
+
+    deduplicated: list[tuple[str, str, bool]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate[0] in seen:
+            continue
+        seen.add(candidate[0])
+        deduplicated.append(candidate)
+    return deduplicated
+
+
 class InstanceLock:
     def __init__(self) -> None:
         self._handle: Any = None
@@ -291,31 +527,56 @@ def request(url: str) -> urllib.request.Request:
 
 def fetch_json(url: str) -> dict[str, Any]:
     last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            with urllib.request.urlopen(request(url), timeout=45) as response:
-                return json.load(response)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.HTTPException) as exc:
-            last_error = exc
-            if attempt < 3:
-                warn(f"查询依赖版本失败，第 {attempt}/3 次重试 …")
-                time.sleep(attempt)
+    candidates = github_request_candidates(url)
+    for candidate_url, source, custom in candidates:
+        attempts = 3 if len(candidates) == 1 else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(request(candidate_url), timeout=45) as response:
+                    value = json.load(response)
+                if not isinstance(value, dict):
+                    raise json.JSONDecodeError("expected a JSON object", "", 0)
+                if candidate_url != url:
+                    info(f"  已通过 GitHub 镜像获取版本信息：{source}")
+                return value
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.HTTPException) as exc:
+                last_error = exc
+                if attempt < attempts:
+                    warn(f"查询依赖版本失败，第 {attempt}/{attempts} 次重试 …")
+                    time.sleep(attempt)
+        if custom and source not in _WARNED_CUSTOM_MIRRORS:
+            warn(f"你提供的镜像域名不可使用：{source}")
+            _WARNED_CUSTOM_MIRRORS.add(source)
     raise DwError("无法查询依赖版本。", str(last_error)) from last_error
 
 
 def download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            with urllib.request.urlopen(request(url), timeout=90) as response, destination.open("wb") as out:
-                shutil.copyfileobj(response, out, length=1024 * 1024)
-            return
-        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
-            last_error = exc
-            if attempt < 3:
-                warn(f"依赖下载失败，第 {attempt}/3 次重试 …")
-                time.sleep(attempt)
+    candidates = github_request_candidates(url)
+    for candidate_url, source, custom in candidates:
+        attempts = 3 if len(candidates) == 1 else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(request(candidate_url), timeout=90) as response, destination.open(
+                    "wb"
+                ) as out:
+                    shutil.copyfileobj(response, out, length=1024 * 1024)
+                if destination.stat().st_size <= 0:
+                    raise OSError("downloaded file is empty")
+                if candidate_url != url:
+                    info(f"  已通过 GitHub 镜像下载：{source}")
+                return
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+                last_error = exc
+                with contextlib.suppress(FileNotFoundError):
+                    destination.unlink()
+                if attempt < attempts:
+                    warn(f"依赖下载失败，第 {attempt}/{attempts} 次重试 …")
+                    time.sleep(attempt)
+        if custom and source not in _WARNED_CUSTOM_MIRRORS:
+            warn(f"你提供的镜像域名不可使用：{source}")
+            _WARNED_CUSTOM_MIRRORS.add(source)
     raise DwError(f"下载依赖失败：{url}", str(last_error)) from last_error
 
 
@@ -372,6 +633,9 @@ def verified_asset(
     download_file(asset_url, asset_path)
     download_file(checksum_url, checksum_path)
     checksum = expected_checksum(checksum_path.read_text(encoding="utf-8"), asset_name)
+    release_digest = str(assets[asset_name].get("digest") or "").lower()
+    if release_digest.startswith("sha256:") and release_digest.removeprefix("sha256:") != checksum:
+        raise DwError(f"{asset_name} 的发布元数据与校验文件不一致，已拒绝安装。")
     actual = sha256_file(asset_path)
     if actual != checksum:
         raise DwError(f"{asset_name} 的 SHA-256 校验失败，已拒绝安装。")
@@ -546,7 +810,8 @@ def cookie_path_present() -> bool:
         return False
 
 
-def ytdlp_base_args() -> list[str]:
+def ytdlp_base_args(policy: RequestPolicy | None = None, url: str = "") -> list[str]:
+    policy = policy or RequestPolicy()
     args = [
         str(YT_DLP),
         "--ignore-config",
@@ -559,14 +824,21 @@ def ytdlp_base_args() -> list[str]:
         "--no-write-comments",
         "--no-write-playlist-metafiles",
     ]
-    if cookie_file_available():
+    if policy.direct:
+        args.extend(("--proxy", ""))
+    if policy.cookie_mode == "browser":
+        args.extend(("--cookies-from-browser", policy.browser))
+    elif policy.cookie_mode == "file" and cookie_file_available():
         args.extend(("--cookies", str(COOKIE_FILE)))
+    if IS_WINDOWS and hostname_matches(url_hostname(url), {"xinpianchang.com"}):
+        args.extend(("--impersonate", "chrome:windows-10"))
     return args
 
 
 def looks_cookie_related(text: str) -> bool:
     lowered = text.lower()
     strong_patterns = (
+        "fresh cookies",
         "cookies are no longer valid",
         "cookie file is not valid",
         "cookie has expired",
@@ -576,7 +848,7 @@ def looks_cookie_related(text: str) -> bool:
         "authentication required",
         "not a bot",
     )
-    return cookie_file_available() and any(pattern in lowered for pattern in strong_patterns)
+    return any(pattern in lowered for pattern in strong_patterns)
 
 
 def run_capture(args: Sequence[str]) -> str:
@@ -609,20 +881,22 @@ def parse_json_output(output: str) -> dict[str, Any]:
     return value
 
 
-def extract_url(url: str, flat_playlist: bool) -> dict[str, Any]:
-    args = ytdlp_base_args()
+def extract_url(url: str, flat_playlist: bool, policy: RequestPolicy | None = None) -> dict[str, Any]:
+    args = ytdlp_base_args(policy, url)
     args.extend(("--dump-single-json", "--flat-playlist" if flat_playlist else "--no-flat-playlist", url))
     return parse_json_output(run_capture(args))
 
 
-def extract_single(url: str) -> dict[str, Any]:
-    args = ytdlp_base_args()
+def extract_single(url: str, policy: RequestPolicy | None = None) -> dict[str, Any]:
+    args = ytdlp_base_args(policy, url)
     args.extend(("--dump-single-json", "--no-playlist", url))
     return parse_json_output(run_capture(args))
 
 
-def extract_playlist_item(playlist_url: str, playlist_index: int) -> dict[str, Any]:
-    args = ytdlp_base_args()
+def extract_playlist_item(
+    playlist_url: str, playlist_index: int, policy: RequestPolicy | None = None
+) -> dict[str, Any]:
+    args = ytdlp_base_args(policy, playlist_url)
     args.extend(
         (
             "--dump-single-json",
@@ -1453,7 +1727,12 @@ def media_candidates(task_dir: Path) -> list[Path]:
 
 
 def build_download_args(
-    url: str, selection: ItemSelection, task_dir: Path, result_file: Path, live: bool
+    url: str,
+    selection: ItemSelection,
+    task_dir: Path,
+    result_file: Path,
+    live: bool,
+    policy: RequestPolicy | None = None,
 ) -> list[str]:
     selector_parts = [str(selection.video.get("format_id"))]
     if not selection.use_embedded_audio:
@@ -1464,7 +1743,7 @@ def build_download_args(
     # track, merge into MKV first, then map only the requested tracks into the
     # final container in normalize_external_audio().
     download_container = "mkv" if selection.replace_embedded_audio else selection.resolved_container
-    args = ytdlp_base_args()
+    args = ytdlp_base_args(policy, url)
     args.extend(
         (
             "--no-playlist",
@@ -1508,9 +1787,15 @@ def build_download_args(
     return args
 
 
-def download_media(url: str, selection: ItemSelection, task_dir: Path, live: bool) -> Path:
+def download_media(
+    url: str,
+    selection: ItemSelection,
+    task_dir: Path,
+    live: bool,
+    policy: RequestPolicy | None = None,
+) -> Path:
     result_file = task_dir / "result-path.txt"
-    args = build_download_args(url, selection, task_dir, result_file, live)
+    args = build_download_args(url, selection, task_dir, result_file, live, policy)
 
     result = run_download_process(args, live=live)
     candidates: list[Path] = []
@@ -1635,9 +1920,12 @@ def ensure_final_container(path: Path, selection: ItemSelection) -> Path:
     return target
 
 
-def thumbnail_opener() -> urllib.request.OpenerDirector:
+def thumbnail_opener(policy: RequestPolicy | None = None) -> urllib.request.OpenerDirector:
+    policy = policy or RequestPolicy()
     handlers: list[Any] = []
-    if cookie_file_available():
+    if policy.direct:
+        handlers.append(urllib.request.ProxyHandler({}))
+    if policy.cookie_mode == "file" and cookie_file_available():
         jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
         try:
             jar.load(ignore_discard=True, ignore_expires=False)
@@ -1648,11 +1936,14 @@ def thumbnail_opener() -> urllib.request.OpenerDirector:
 
 
 def download_thumbnails(
-    selected: list[dict[str, Any]], info_dict: dict[str, Any], task_dir: Path
+    selected: list[dict[str, Any]],
+    info_dict: dict[str, Any],
+    task_dir: Path,
+    policy: RequestPolicy | None = None,
 ) -> list[tuple[Path, dict[str, Any]]]:
     if not selected:
         return []
-    opener = thumbnail_opener()
+    opener = thumbnail_opener(policy)
     common_headers = {
         str(key): str(value)
         for key, value in (info_dict.get("http_headers") or {}).items()
@@ -1761,6 +2052,7 @@ def process_item(
     live: bool,
     reserved: set[Path],
     batch_id: str,
+    policy: RequestPolicy | None = None,
 ) -> ItemResult:
     title = printable_title(info_dict, str(info_dict.get("id") or "未命名视频"))
     task_id = f"{batch_id}-{uuid.uuid4().hex[:10]}"
@@ -1770,11 +2062,11 @@ def process_item(
     finalized: list[Path] = []
     try:
         info(f"\n开始处理：{title}")
-        media = download_media(url, selection, task_dir, live)
+        media = download_media(url, selection, task_dir, live, policy)
         media = normalize_external_audio(media, selection)
         media = ensure_final_container(media, selection)
         validate_media(media)
-        images = download_thumbnails(selection.thumbnails, info_dict, task_dir)
+        images = download_thumbnails(selection.thumbnails, info_dict, task_dir, policy)
         finalized = finalize_item(title, media, images, reserved, task_id)
         # Record ownership immediately after the atomic move instead of waiting
         # for the whole playlist.  A later batch cancellation removes both the
@@ -1822,9 +2114,9 @@ def confirm_live(info_dict: dict[str, Any]) -> bool:
     return ask_yes_no("是否开始录制直播", default=False)
 
 
-def wait_for_upcoming(url: str) -> dict[str, Any]:
+def wait_for_upcoming(url: str, policy: RequestPolicy | None = None) -> dict[str, Any]:
     info("正在等待直播开始；等待期间按 Ctrl+C 将取消任务 …")
-    args = ytdlp_base_args()
+    args = ytdlp_base_args(policy, url)
     args.extend(("--dump-single-json", "--no-playlist", "--wait-for-video", "30-60", url))
     try:
         return parse_json_output(run_capture(args))
@@ -1832,17 +2124,134 @@ def wait_for_upcoming(url: str) -> dict[str, Any]:
         raise DownloadAborted from exc
 
 
-def cookie_status() -> None:
-    if cookie_file_available():
-        info(f"已发现并启用 cookies：{COOKIE_FILE}")
-    else:
-        info(f"未检测到 cookies：{COOKIE_FILE}")
+def chrome_profile_present() -> bool:
+    if IS_WINDOWS:
+        local_value = os.environ.get("LOCALAPPDATA")
+        return bool(local_value) and (Path(local_value) / "Google" / "Chrome" / "User Data").is_dir()
+    home = Path.home()
+    return any(
+        path.is_dir()
+        for path in (
+            home / ".config" / "google-chrome",
+            home / ".config" / "chromium",
+        )
+    )
+
+
+def choose_cookie_mode(urls: Sequence[str] = ()) -> str:
+    info("\nCookies 使用方式：")
+    hostnames = list(dict.fromkeys(url_hostname(url) for url in urls if url_hostname(url)))
+    if hostnames:
+        info("本次已选网站：" + "、".join(hostnames))
+    info("智能模式会由 yt-dlp 临时读取 Chrome，并按当前网站自动匹配 Cookies。")
+    browser_note = "已检测到 Chrome" if chrome_profile_present() else "未检测到 Chrome 配置"
+    file_note = "已检测到文件" if cookie_file_available() else "未检测到文件"
+    info(f"1. 同意智能读取 Chrome Cookies（推荐，仅本次任务；{browser_note}）")
+    info(f"2. 使用我手动上传的 cookies.txt（{file_note}：{COOKIE_FILE}）")
+    info("3. 不使用 Cookies")
+    while True:
+        choice = input("请选择 Cookies 使用方式：").strip()
+        if choice == "1":
+            if not chrome_profile_present():
+                warn("未检测到默认 Chrome 用户配置，智能读取可能失败。")
+                if not ask_yes_no("仍要尝试智能读取 Chrome Cookies", default=False):
+                    continue
+            info("已获得授权：本次任务将由 yt-dlp 临时读取 Chrome Cookies。")
+            info("不会导出、上传或在 dw 状态目录中保存浏览器 Cookies。")
+            return "browser"
+        if choice == "2":
+            if not cookie_file_available():
+                warn(f"未检测到 cookies：{COOKIE_FILE}，请上传后重新选择。")
+                continue
+            info(f"已发现并启用 cookies：{COOKIE_FILE}")
+            return "file"
+        if choice == "3":
+            info("本次任务不使用 Cookies。")
+            return "none"
+        warn("请输入 1、2 或 3。")
+
+
+def initial_request_policy(url: str, cookie_mode: str) -> RequestPolicy:
+    direct = is_domestic_url(url)
+    if direct:
+        info("检测到国内网站，本任务优先强制直连。")
+        if system_proxy_configured():
+            warn("已检测到系统代理；若代理软件启用了 TUN 模式，请同时将该网站设置为 DIRECT。")
+    return RequestPolicy(direct=direct, cookie_mode=cookie_mode)
+
+
+def network_retry_recommended(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "http error",
+            "unable to download",
+            "connection",
+            "network",
+            "proxy",
+            "timed out",
+            "timeout",
+            "temporary failure",
+        )
+    )
+
+
+def xinpianchang_verification_failure(url: str, detail: str) -> bool:
+    lowered = detail.lower()
+    return hostname_matches(url_hostname(url), {"xinpianchang.com"}) and any(
+        marker in lowered for marker in ("http error 403", "403: forbidden")
+    )
+
+
+def next_request_policy(url: str, policy: RequestPolicy, exc: DwError) -> RequestPolicy | None:
+    detail = exc.detail or exc.message
+    xinpianchang_verification = xinpianchang_verification_failure(url, detail)
+    if (
+        xinpianchang_verification
+        and policy.cookie_mode == "browser"
+        and not policy.browser_refresh_attempted
+    ):
+        warn("新片场首次访问可能需要先在 Chrome 打开该链接并完成页面勾选/验证。")
+        if ask_yes_no("完成后是否使用更新的 Chrome Cookies 重试", default=False):
+            return dataclasses.replace(policy, browser_refresh_attempted=True)
+    if policy.cookie_mode != "browser" and browser_cookie_retry_recommended(url, detail):
+        warn("当前 Cookies 或站点验证未通过。")
+        if xinpianchang_verification:
+            warn("请先在 Chrome 打开该新片场链接，完成首次页面勾选/验证。")
+        if ask_yes_no("是否同意本次任务临时读取 Chrome Cookies 后重试", default=False):
+            return dataclasses.replace(
+                policy,
+                cookie_mode="browser",
+                browser_refresh_attempted=xinpianchang_verification,
+            )
+    if policy.direct and network_retry_recommended(detail):
+        warn("国内网站直连请求失败。")
+        if ask_yes_no("是否使用系统代理重试", default=False):
+            return dataclasses.replace(policy, direct=False)
+    return None
+
+
+def run_with_policy_retries(url: str, policy: RequestPolicy, operation: Any) -> tuple[Any, RequestPolicy]:
+    current = policy
+    while True:
+        try:
+            return operation(current), current
+        except DwError as exc:
+            replacement = next_request_policy(url, current, exc)
+            if replacement is None:
+                raise
+            current = replacement
+            if current.cookie_mode == "browser":
+                info("正在使用获准的 Chrome Cookies 重试 …")
+            elif not current.direct:
+                info("正在使用系统代理重试 …")
 
 
 def show_dw_error(exc: DwError) -> None:
     error(exc.message)
     if exc.cookie_related:
-        error(f"cookies 可能已失效，请重新上传 {COOKIE_FILE}。")
+        error(f"Cookies 可能已失效或与当前网站不匹配；请重新登录 Chrome 或更新 {COOKIE_FILE}。")
     if exc.detail:
         detail_lines = exc.detail.strip().splitlines()
         info("失败原因：")
@@ -1891,15 +2300,153 @@ def cleanup_paths(paths: Iterable[Path]) -> list[Path]:
     return failed
 
 
+def choose_urls_from_share_text(text: str) -> list[str]:
+    urls = extract_urls_from_text(text)
+    if not urls:
+        raise DwError("没有在输入内容中找到有效的 http:// 或 https:// 链接。")
+    if len(urls) == 1:
+        info(f"已自动提取链接：{urls[0]}")
+        return urls
+
+    info("\n检测到多个不同链接：")
+    for index, url in enumerate(urls, 1):
+        info(f"{index}. {url}")
+    selected = ask_number_selection(
+        "请选择要处理的链接（例如 1,3,5-9；全部输入 a）：",
+        len(urls),
+        allow_all=True,
+        multiple=True,
+    )
+    return [urls[index - 1] for index in selected]
+
+
+def process_top_level_url(
+    url: str,
+    cookie_mode: str,
+    batch_id: str,
+    results: list[ItemResult],
+    failures: list[tuple[str, str]],
+    created_paths: list[Path],
+    reserved: set[Path],
+) -> str:
+    policy = initial_request_policy(url, cookie_mode)
+    info("正在读取链接信息 …")
+    root, policy = run_with_policy_retries(
+        url,
+        policy,
+        lambda current: extract_url(url, flat_playlist=True, policy=current),
+    )
+
+    if is_playlist(root):
+        entries = [entry for entry in root.get("entries") or [] if isinstance(entry, dict)]
+        if not entries:
+            raise DwError("播放列表为空或没有可访问项目。")
+        display_playlist(entries)
+        selected = ask_number_selection(
+            "请选择播放列表项目（例如 1,3,5-9；全部输入 a）：",
+            len(entries),
+            allow_all=True,
+            multiple=True,
+        )
+        profile: SelectionProfile | None = None
+        for position, playlist_index in enumerate(selected, 1):
+            flat_entry = entries[playlist_index - 1]
+            fallback_title = printable_title(flat_entry, f"第 {playlist_index} 项")
+            info(f"\n[{position}/{len(selected)}] 正在读取：{fallback_title}")
+            try:
+                item_info, policy = run_with_policy_retries(
+                    url,
+                    policy,
+                    lambda current, index=playlist_index: extract_playlist_item(url, index, current),
+                )
+                item_url = str(
+                    item_info.get("webpage_url")
+                    or item_info.get("original_url")
+                    or item_info.get("url")
+                    or ""
+                )
+                if not re.match(r"^https?://", item_url, flags=re.IGNORECASE):
+                    raise DwError("无法获得当前播放列表项目的完整链接。")
+                live = is_live_info(item_info) or is_upcoming_info(item_info)
+                if live and not confirm_live(item_info):
+                    failures.append((fallback_title, "用户取消直播录制"))
+                    continue
+                if is_upcoming_info(item_info):
+                    item_info, policy = run_with_policy_retries(
+                        item_url,
+                        policy,
+                        lambda current: wait_for_upcoming(item_url, current),
+                    )
+                    live = True
+                if profile is None:
+                    selection, profile = choose_initial_selection(item_info)
+                else:
+                    selection = choose_matched_selection(item_info, profile)
+                result, policy = run_with_policy_retries(
+                    item_url,
+                    policy,
+                    lambda current: process_item(
+                        item_url,
+                        item_info,
+                        selection,
+                        live,
+                        reserved,
+                        batch_id,
+                        current,
+                    ),
+                )
+                results.append(result)
+                created_paths.extend(result.paths)
+            except DownloadAborted:
+                raise
+            except DwError as exc:
+                show_dw_error(exc)
+                failures.append((fallback_title, concise_error_reason(exc)))
+            except Exception as exc:  # defensive boundary for one playlist item
+                error(f"当前项目出现意外错误：{exc}")
+                failures.append((fallback_title, str(exc)))
+        return policy.cookie_mode
+
+    item_info, policy = run_with_policy_retries(
+        url,
+        policy,
+        lambda current: extract_single(url, current),
+    )
+    live = is_live_info(item_info) or is_upcoming_info(item_info)
+    if live and not confirm_live(item_info):
+        raise DownloadAborted
+    if is_upcoming_info(item_info):
+        item_info, policy = run_with_policy_retries(
+            url,
+            policy,
+            lambda current: wait_for_upcoming(url, current),
+        )
+        live = True
+    selection, _profile = choose_initial_selection(item_info)
+    result, policy = run_with_policy_retries(
+        url,
+        policy,
+        lambda current: process_item(
+            url,
+            item_info,
+            selection,
+            live,
+            reserved,
+            batch_id,
+            current,
+        ),
+    )
+    results.append(result)
+    created_paths.extend(result.paths)
+    return policy.cookie_mode
+
+
 def download_task() -> None:
     install_or_update_dependencies(force=False)
-    cookie_status()
-    url = input("请粘贴下载链接：").strip()
-    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
-        raise DwError("链接必须以 http:// 或 https:// 开头。")
+    share_text = input("请粘贴下载链接或完整分享文案：").strip()
+    urls = choose_urls_from_share_text(share_text)
+    cookie_mode = choose_cookie_mode(urls)
 
-    info("正在读取链接信息 …")
-    root = extract_url(url, flat_playlist=True)
     batch_id = uuid.uuid4().hex
     results: list[ItemResult] = []
     failures: list[tuple[str, str]] = []
@@ -1907,61 +2454,27 @@ def download_task() -> None:
     reserved: set[Path] = set()
 
     try:
-        if is_playlist(root):
-            entries = [entry for entry in root.get("entries") or [] if isinstance(entry, dict)]
-            if not entries:
-                raise DwError("播放列表为空或没有可访问项目。")
-            display_playlist(entries)
-            selected = ask_number_selection(
-                "请选择播放列表项目（例如 1,3,5-9；全部输入 a）：",
-                len(entries),
-                allow_all=True,
-                multiple=True,
-            )
-            profile: SelectionProfile | None = None
-            for position, playlist_index in enumerate(selected, 1):
-                flat_entry = entries[playlist_index - 1]
-                fallback_title = printable_title(flat_entry, f"第 {playlist_index} 项")
-                info(f"\n[{position}/{len(selected)}] 正在读取：{fallback_title}")
-                try:
-                    item_info = extract_playlist_item(url, playlist_index)
-                    item_url = str(item_info.get("webpage_url") or item_info.get("original_url") or item_info.get("url") or "")
-                    if not re.match(r"^https?://", item_url, flags=re.IGNORECASE):
-                        raise DwError("无法获得当前播放列表项目的完整链接。")
-                    live = is_live_info(item_info) or is_upcoming_info(item_info)
-                    if live and not confirm_live(item_info):
-                        failures.append((fallback_title, "用户取消直播录制"))
-                        continue
-                    if is_upcoming_info(item_info):
-                        item_info = wait_for_upcoming(item_url)
-                        live = True
-                    if profile is None:
-                        selection, profile = choose_initial_selection(item_info)
-                    else:
-                        selection = choose_matched_selection(item_info, profile)
-                    result = process_item(item_url, item_info, selection, live, reserved, batch_id)
-                    results.append(result)
-                    created_paths.extend(result.paths)
-                except DownloadAborted:
-                    raise
-                except DwError as exc:
-                    show_dw_error(exc)
-                    failures.append((fallback_title, concise_error_reason(exc)))
-                except Exception as exc:  # defensive boundary for one playlist item
-                    error(f"当前项目出现意外错误：{exc}")
-                    failures.append((fallback_title, str(exc)))
-        else:
-            item_info = extract_single(url)
-            live = is_live_info(item_info) or is_upcoming_info(item_info)
-            if live and not confirm_live(item_info):
-                raise DownloadAborted
-            if is_upcoming_info(item_info):
-                item_info = wait_for_upcoming(url)
-                live = True
-            selection, _profile = choose_initial_selection(item_info)
-            result = process_item(url, item_info, selection, live, reserved, batch_id)
-            results.append(result)
-            created_paths.extend(result.paths)
+        for position, url in enumerate(urls, 1):
+            if len(urls) > 1:
+                info(f"\n========== 链接 {position}/{len(urls)} ==========")
+            try:
+                cookie_mode = process_top_level_url(
+                    url,
+                    cookie_mode,
+                    batch_id,
+                    results,
+                    failures,
+                    created_paths,
+                    reserved,
+                )
+            except DownloadAborted:
+                raise
+            except DwError as exc:
+                show_dw_error(exc)
+                failures.append((url, concise_error_reason(exc)))
+            except Exception as exc:  # defensive boundary for one shared URL
+                error(f"当前链接出现意外错误：{exc}")
+                failures.append((url, str(exc)))
     except (DownloadAborted, KeyboardInterrupt):
         info("\n正在取消任务并删除本次任务的全部文件 …")
         failed_cleanup = cleanup_paths(created_paths)

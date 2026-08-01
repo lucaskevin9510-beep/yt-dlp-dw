@@ -78,6 +78,50 @@ class SelectionParserTests(unittest.TestCase):
             dw.parse_number_selection("11", 10)
 
 
+class ShareTextTests(unittest.TestCase):
+    XHS_URL = (
+        "https://www.xiaohongshu.com/discovery/item/6a6d5495000000002403c0c8"
+        "?source=webshare&xhsshare=pc_web&xsec_token=token=&xsec_source=pc_share"
+    )
+
+    def test_extracts_xiaohongshu_url_from_full_share_text(self) -> None:
+        text = f"87 【标题 - 作者 | 小红书】 😆 分享码 😆 {self.XHS_URL}"
+        self.assertEqual(dw.extract_urls_from_text(text), [self.XHS_URL])
+
+    def test_trailing_emoji_is_not_included_in_url(self) -> None:
+        text = f"完整分享文案 {self.XHS_URL}😆复制后打开"
+        self.assertEqual(dw.extract_urls_from_text(text), [self.XHS_URL])
+
+    def test_concatenated_and_markdown_duplicate_urls_are_deduplicated(self) -> None:
+        text = f"[{self.XHS_URL}{self.XHS_URL}]({self.XHS_URL})"
+        self.assertEqual(dw.extract_urls_from_text(text), [self.XHS_URL])
+
+    def test_html_escaped_query_is_restored(self) -> None:
+        escaped = self.XHS_URL.replace("&", "&amp;")
+        self.assertEqual(dw.extract_urls_from_text(escaped), [self.XHS_URL])
+
+    def test_douyin_modal_share_url_is_normalized(self) -> None:
+        text = "分享 https://www.douyin.com/jingxuan?modal_id=7661530014969969381 复制"
+        self.assertEqual(
+            dw.extract_urls_from_text(text),
+            ["https://www.douyin.com/video/7661530014969969381"],
+        )
+
+    def test_douyin_short_share_url_is_preserved(self) -> None:
+        text = "8.74 nqr:/ #恋爱脑 https://v.douyin.com/3qaI6648IrI/ 复制此链接"
+        self.assertEqual(
+            dw.extract_urls_from_text(text),
+            ["https://v.douyin.com/3qaI6648IrI/"],
+        )
+
+    def test_multiple_different_urls_remain_selectable(self) -> None:
+        text = "第一个 https://example.test/a 第二个 https://example.test/b"
+        self.assertEqual(
+            dw.extract_urls_from_text(text),
+            ["https://example.test/a", "https://example.test/b"],
+        )
+
+
 class FormatTests(unittest.TestCase):
     def test_video_sorting_groups_containers_then_quality(self) -> None:
         values = [
@@ -246,6 +290,90 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(1)
 
+    def test_custom_github_mirror_is_tried_before_official_and_builtins(self) -> None:
+        with mock.patch.dict(
+            dw.os.environ,
+            {"DW_GITHUB_MIRRORS": "https://mirror.example/{url}"},
+            clear=False,
+        ), mock.patch.object(dw, "GITHUB_MIRRORS_FILE", Path("missing-mirrors.txt")):
+            candidates = dw.github_request_candidates(
+                "https://api.github.com/repos/example/project/releases/latest"
+            )
+        self.assertEqual(
+            candidates[0][0],
+            "https://mirror.example/https://api.github.com/repos/example/project/releases/latest",
+        )
+        self.assertTrue(candidates[0][2])
+        self.assertEqual(candidates[1][1], "GitHub 官方源")
+
+    def test_invalid_custom_mirror_is_rejected_with_required_message(self) -> None:
+        dw._WARNED_CUSTOM_MIRRORS.clear()
+        with mock.patch.dict(dw.os.environ, {"DW_GITHUB_MIRRORS": "http://unsafe.example"}), mock.patch.object(
+            dw, "GITHUB_MIRRORS_FILE", Path("missing-mirrors.txt")
+        ), mock.patch.object(dw, "warn") as warning:
+            self.assertEqual(dw.configured_github_mirrors(), [])
+        warning.assert_called_once_with("你提供的镜像域名不可使用：http://unsafe.example")
+
+    def test_domestic_sites_use_direct_policy(self) -> None:
+        self.assertTrue(dw.is_domestic_url("https://v.douyin.com/example/"))
+        self.assertTrue(dw.is_domestic_url("https://www.xiaohongshu.com/explore/id"))
+        self.assertTrue(dw.is_domestic_url("https://example.cn/video"))
+        self.assertFalse(dw.is_domestic_url("https://www.youtube.com/watch?v=x"))
+
+    def test_direct_browser_cookie_args_are_explicit(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="browser")
+        with mock.patch.object(dw, "IS_WINDOWS", True):
+            args = dw.ytdlp_base_args(policy, "https://www.xinpianchang.com/a123")
+        self.assertEqual(args[args.index("--proxy") + 1], "")
+        self.assertEqual(args[args.index("--cookies-from-browser") + 1], "chrome")
+        self.assertEqual(args[args.index("--impersonate") + 1], "chrome:windows-10")
+
+    def test_xinpianchang_impersonation_also_applies_to_manual_cookies(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="file")
+        with mock.patch.object(dw, "IS_WINDOWS", True), mock.patch.object(
+            dw, "cookie_file_available", return_value=True
+        ):
+            args = dw.ytdlp_base_args(policy, "https://www.xinpianchang.com/a123")
+        self.assertEqual(args[args.index("--impersonate") + 1], "chrome:windows-10")
+        self.assertEqual(args[args.index("--cookies") + 1], str(dw.COOKIE_FILE))
+
+    def test_proxy_retry_requires_confirmation(self) -> None:
+        policy = dw.RequestPolicy(
+            direct=True,
+            cookie_mode="browser",
+            browser_refresh_attempted=True,
+        )
+        failure = dw.DwError("读取失败", "HTTP Error 403: Forbidden")
+        with mock.patch.object(dw, "ask_yes_no", return_value=False) as ask:
+            self.assertIsNone(dw.next_request_policy("https://www.xinpianchang.com/a1", policy, failure))
+        ask.assert_called_once_with("是否使用系统代理重试", default=False)
+
+    def test_xinpianchang_browser_verification_can_be_retried_once(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="browser")
+        failure = dw.DwError("读取失败", "HTTP Error 403: Forbidden")
+        with mock.patch.object(dw, "ask_yes_no", return_value=True) as ask:
+            replacement = dw.next_request_policy(
+                "https://www.xinpianchang.com/a12303964",
+                policy,
+                failure,
+            )
+        self.assertIsNotNone(replacement)
+        self.assertTrue(replacement.browser_refresh_attempted)
+        ask.assert_called_once_with("完成后是否使用更新的 Chrome Cookies 重试", default=False)
+
+    def test_cookie_failure_can_upgrade_manual_mode_with_consent(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="file")
+        failure = dw.DwError("读取失败", "Fresh cookies needed")
+        with mock.patch.object(dw, "ask_yes_no", return_value=True) as ask:
+            replacement = dw.next_request_policy(
+                "https://www.douyin.com/video/123",
+                policy,
+                failure,
+            )
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.cookie_mode, "browser")
+        ask.assert_called_once_with("是否同意本次任务临时读取 Chrome Cookies 后重试", default=False)
+
     def test_dependency_asset_layouts(self) -> None:
         with mock.patch.object(dw, "IS_WINDOWS", True):
             self.assertEqual(dw.ytdlp_asset_name(), "yt-dlp.exe")
@@ -325,6 +453,12 @@ class PlatformSupportTests(unittest.TestCase):
 
 
 class FilesystemSafetyTests(unittest.TestCase):
+    def test_cookie_file_requires_an_explicit_task_policy(self) -> None:
+        with mock.patch.object(dw, "cookie_file_available", return_value=True):
+            self.assertNotIn("--cookies", dw.ytdlp_base_args())
+            explicit = dw.ytdlp_base_args(dw.RequestPolicy(cookie_mode="file"))
+        self.assertEqual(explicit[explicit.index("--cookies") + 1], str(dw.COOKIE_FILE))
+
     def test_inaccessible_cookie_file_is_treated_as_absent(self) -> None:
         inaccessible = mock.Mock()
         inaccessible.is_file.side_effect = PermissionError("permission denied")

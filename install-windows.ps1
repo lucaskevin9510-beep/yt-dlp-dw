@@ -17,6 +17,12 @@ $PythonArchive = "python-$PythonVersion-embed-amd64.zip"
 $PythonUrl = "https://www.python.org/ftp/python/$PythonVersion/$PythonArchive"
 $PythonSha256 = "90b4e5b9898b72d744650524bff92377c367f44bd5fbd09e3148656c080ad907"
 $RawBase = "https://raw.githubusercontent.com/$Repository/$RepositoryRef"
+$JsDelivrBase = "https://cdn.jsdelivr.net/gh/$Repository@$RepositoryRef"
+$BuiltInGithubMirrors = @(
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/"
+)
 $AppDir = if ($env:DW_APP_DIR) { $env:DW_APP_DIR } else { Join-Path $env:LOCALAPPDATA "yt-dlp-dw" }
 $StateDir = if ($env:DW_STATE_DIR) { $env:DW_STATE_DIR } else { Join-Path $env:LOCALAPPDATA "yt-dlp-dw-data" }
 $CommandDir = if ($env:DW_COMMAND_DIR) { $env:DW_COMMAND_DIR } else { Join-Path $AppDir "command" }
@@ -27,7 +33,12 @@ $CleanupScript = Join-Path $AppDir "uninstall-windows.ps1"
 $Launcher = Join-Path $CommandDir "dw.cmd"
 $AppMarker = Join-Path $AppDir ".dw-owned"
 $StateMarker = Join-Path $StateDir ".dw-owned"
+$MirrorFile = Join-Path $StateDir "github-mirrors.txt"
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("dw-install-" + [Guid]::NewGuid().ToString("N"))
+$CustomMirrorFailureText = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("5L2g5o+Q5L6b55qE6ZWc5YOP5Z+f5ZCN5LiN5Y+v5L2/55So")
+)
+$WorkingCustomMirrors = New-Object System.Collections.Generic.List[string]
 
 function Fail([string]$Message) {
     throw "Install failed: $Message"
@@ -69,15 +80,119 @@ function Assert-OwnedDirectory([string]$Path, [string]$Marker) {
     }
 }
 
-function Get-RemoteFile([string]$Uri, [string]$Destination) {
-    Write-Host "Downloading $Uri"
-    Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
-    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
-        Fail "download did not create $Destination."
+function Get-ConfiguredGithubMirrors {
+    $Values = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($env:DW_GITHUB_MIRRORS)) {
+        foreach ($Value in ($env:DW_GITHUB_MIRRORS -split "[;,`r`n]+")) {
+            $Values.Add($Value)
+        }
     }
-    if ((Get-Item -LiteralPath $Destination).Length -le 0) {
-        Fail "downloaded file is empty: $Uri"
+    if (Test-Path -LiteralPath $MirrorFile -PathType Leaf) {
+        foreach ($Value in (Get-Content -LiteralPath $MirrorFile)) {
+            $Values.Add($Value)
+        }
     }
+
+    $Mirrors = New-Object System.Collections.Generic.List[string]
+    foreach ($RawValue in $Values) {
+        $Mirror = $RawValue.Trim()
+        if ([string]::IsNullOrWhiteSpace($Mirror) -or $Mirror.StartsWith("#") -or $Mirrors.Contains($Mirror)) {
+            continue
+        }
+        $Probe = $Mirror.Replace("{url}", "https://github.com/")
+        try {
+            $Parsed = [Uri]$Probe
+            if ($Parsed.Scheme -ne "https" -or [string]::IsNullOrWhiteSpace($Parsed.Host)) {
+                throw "invalid mirror"
+            }
+            $Mirrors.Add($Mirror)
+        } catch {
+            Write-Warning "$CustomMirrorFailureText`: $Mirror"
+        }
+    }
+    return @($Mirrors)
+}
+
+function Apply-GithubMirror([string]$Mirror, [string]$Uri) {
+    if ($Mirror.Contains("{url}")) {
+        return $Mirror.Replace("{url}", $Uri)
+    }
+    return $Mirror.TrimEnd("/") + "/" + $Uri
+}
+
+function Get-GithubCandidates([string]$Uri, [string]$RepositoryPath) {
+    $Candidates = New-Object System.Collections.Generic.List[object]
+    foreach ($Mirror in (Get-ConfiguredGithubMirrors)) {
+        $Candidates.Add([pscustomobject]@{
+            Uri = Apply-GithubMirror $Mirror $Uri
+            Source = $Mirror
+            Custom = $true
+        })
+    }
+    $Candidates.Add([pscustomobject]@{ Uri = $Uri; Source = "GitHub official"; Custom = $false })
+    if (-not [string]::IsNullOrWhiteSpace($RepositoryPath)) {
+        $Candidates.Add([pscustomobject]@{
+            Uri = "$JsDelivrBase/$RepositoryPath"
+            Source = "https://cdn.jsdelivr.net/"
+            Custom = $false
+        })
+    }
+    foreach ($Mirror in $BuiltInGithubMirrors) {
+        $Candidates.Add([pscustomobject]@{
+            Uri = Apply-GithubMirror $Mirror $Uri
+            Source = $Mirror
+            Custom = $false
+        })
+    }
+    return @($Candidates | Group-Object -Property Uri | ForEach-Object { $_.Group[0] })
+}
+
+function Get-RemoteFile(
+    [string]$Uri,
+    [string]$Destination,
+    [string]$RepositoryPath = "",
+    [string]$Identity = ""
+) {
+    $IsGithub = $Uri -match "^https://(raw\.githubusercontent\.com|github\.com|api\.github\.com)/"
+    $Candidates = if ($IsGithub) {
+        Get-GithubCandidates $Uri $RepositoryPath
+    } else {
+        @([pscustomobject]@{ Uri = $Uri; Source = "official"; Custom = $false })
+    }
+    $LastError = "unknown error"
+    foreach ($Candidate in $Candidates) {
+        if (Test-Path -LiteralPath $Destination) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            Write-Host "Downloading $($Candidate.Uri)"
+            Invoke-WebRequest -UseBasicParsing -Uri $Candidate.Uri -OutFile $Destination -TimeoutSec 90
+            if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+                throw "download did not create $Destination"
+            }
+            if ((Get-Item -LiteralPath $Destination).Length -le 0) {
+                throw "downloaded file is empty"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($Identity) -and -not (
+                Select-String -LiteralPath $Destination -SimpleMatch $Identity -Quiet
+            )) {
+                throw "downloaded file failed its identity check"
+            }
+            if ($Candidate.Custom -and -not $WorkingCustomMirrors.Contains($Candidate.Source)) {
+                $WorkingCustomMirrors.Add($Candidate.Source)
+            }
+            if ($Candidate.Uri -ne $Uri) {
+                Write-Host "Using GitHub mirror: $($Candidate.Source)"
+            }
+            return
+        } catch {
+            $LastError = $_.Exception.Message
+            if ($Candidate.Custom) {
+                Write-Warning "$CustomMirrorFailureText`: $($Candidate.Source)"
+            }
+        }
+    }
+    Fail "all download sources failed for $Uri ($LastError)."
 }
 
 function Install-AtomicFile([string]$Source, [string]$Destination) {
@@ -202,7 +317,8 @@ function Resolve-InstallerSource([string]$RelativePath, [string]$RemotePath, [st
         }
     }
     $Destination = Join-Path $TempDir $TemporaryName
-    Get-RemoteFile "$RawBase/$RemotePath" $Destination
+    $Identity = if ($RemotePath -eq "src/dw.py") { "yt-dlp-dw" } else { "dw-managed-windows-cleanup" }
+    Get-RemoteFile "$RawBase/$RemotePath" $Destination $RemotePath $Identity
     return $Destination
 }
 
@@ -234,6 +350,10 @@ try {
     }
     Install-AtomicFile $SourceScript $DwScript
     Install-AtomicFile $SourceCleanup $CleanupScript
+
+    if ($WorkingCustomMirrors.Count -gt 0) {
+        [IO.File]::WriteAllLines($MirrorFile, @($WorkingCustomMirrors), [Text.UTF8Encoding]::new($false))
+    }
 
     if ((Test-Path -LiteralPath $Launcher -PathType Leaf) -and -not (Select-String -LiteralPath $Launcher -SimpleMatch "dw-managed-launcher" -Quiet)) {
         Fail "$Launcher exists and is not owned by dw."
