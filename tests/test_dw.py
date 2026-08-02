@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import io
+import shutil
 import sys
-import tempfile
 import unittest
 import urllib.error
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +22,17 @@ sys.modules[SPEC.name] = dw
 SPEC.loader.exec_module(dw)
 
 
+@contextlib.contextmanager
+def writable_test_directory():
+    """Avoid Python 3.13's Windows 0o700 ACL, which blocks sandboxed test subprocesses."""
+    path = TEST_ROOT / f".dw-test-{uuid.uuid4().hex}"
+    path.mkdir(mode=0o777)
+    try:
+        yield str(path)
+    finally:
+        shutil.rmtree(path)
+
+
 def video(
     format_id: str,
     ext: str,
@@ -30,6 +43,7 @@ def video(
     vcodec: str = "avc1.640028",
     acodec: str = "none",
     tbr: int = 1000,
+    filesize: int | None = None,
     note: str = "",
     protocol: str = "https",
 ) -> dict:
@@ -42,6 +56,7 @@ def video(
         "vcodec": vcodec,
         "acodec": acodec,
         "tbr": tbr,
+        "filesize": filesize,
         "format_note": note,
         "protocol": protocol,
         "url": f"https://example.test/{format_id}",
@@ -134,6 +149,28 @@ class FormatTests(unittest.TestCase):
         ordered = dw.video_formats({"formats": values})
         self.assertEqual([item["format_id"] for item in ordered], ["m1080", "m720", "w1080", "w720", "x2160"])
 
+    def test_video_sorting_prioritizes_h264_then_estimated_size(self) -> None:
+        values = [
+            video("h265-large", "mp4", 2160, vcodec="hvc1.1.6", filesize=50_000_000),
+            video("h264-small", "mp4", 720, filesize=8_000_000),
+            video("h264-large", "mp4", 1080, filesize=12_000_000),
+        ]
+        ordered = dw.video_formats({"formats": values})
+        self.assertEqual(
+            [item["format_id"] for item in ordered],
+            ["h264-large", "h264-small", "h265-large"],
+        )
+
+    def test_explicitly_watermarked_variant_is_hidden_when_clean_stream_exists(self) -> None:
+        values = [
+            video("download_addr", "mp4", 1080, note="Download video, watermarked"),
+            video("play_addr", "mp4", 1080, note="Direct video"),
+        ]
+        self.assertEqual(
+            [item["format_id"] for item in dw.video_formats({"formats": values})],
+            ["play_addr"],
+        )
+
     def test_storyboards_are_hidden(self) -> None:
         values = [
             video("real", "mp4", 1080),
@@ -210,6 +247,33 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(args[args.index("--format") + 1], "v1+a1")
         self.assertEqual(args[args.index("--merge-output-format") + 1], "mkv")
         self.assertEqual(args[args.index("--remux-video") + 1], "mkv")
+
+    def test_container_menu_enter_defaults_to_auto(self) -> None:
+        selected_video = video("v", "mp4", 1080, acodec="aac")
+        with mock.patch("builtins.input", return_value=""):
+            self.assertEqual(dw.ask_container(selected_video, [], True), ("auto", "mp4"))
+
+    def test_matching_extension_is_still_remuxed_to_strip_metadata(self) -> None:
+        selection = dw.ItemSelection(
+            video=video("v", "mp4", 1080, acodec="aac"),
+            audios=[],
+            use_embedded_audio=True,
+            replace_embedded_audio=False,
+            container_mode="auto",
+            resolved_container="mp4",
+            thumbnails=[],
+        )
+        with writable_test_directory() as temp:
+            source = Path(temp) / "source.mp4"
+            source.write_bytes(b"media")
+            result = mock.Mock(returncode=0, stderr="")
+            with mock.patch.object(dw.subprocess, "run", return_value=result) as run:
+                target = dw.ensure_final_container(source, selection)
+        command = run.call_args.args[0]
+        self.assertIn("-map_metadata", command)
+        self.assertIn("-map_chapters", command)
+        self.assertIn("copy", command)
+        self.assertEqual(target.suffix, ".mp4")
 
 
 class ThumbnailTests(unittest.TestCase):
@@ -290,6 +354,30 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(1)
 
+    def test_dependency_download_reports_percentage_size_and_speed(self) -> None:
+        payload = b"progress-test" * 100
+        source = mock.Mock()
+        source.headers = {"Content-Length": str(len(payload))}
+        source.read = io.BytesIO(payload).read
+        output = io.BytesIO()
+        console = io.StringIO()
+        with mock.patch.object(dw.sys, "stdout", console):
+            copied = dw.copy_response_with_progress(source, output, "asset.zip")
+        self.assertEqual(copied, len(payload))
+        self.assertEqual(output.getvalue(), payload)
+        self.assertIn("asset.zip", console.getvalue())
+        self.assertIn("100.0%", console.getvalue())
+        self.assertIn("/s", console.getvalue())
+
+    def test_dependency_download_rejects_incomplete_content_length(self) -> None:
+        payload = b"short"
+        source = mock.Mock()
+        source.headers = {"Content-Length": str(len(payload) + 1)}
+        source.read = io.BytesIO(payload).read
+        with mock.patch.object(dw.sys, "stdout", io.StringIO()):
+            with self.assertRaisesRegex(OSError, "incomplete download"):
+                dw.copy_response_with_progress(source, io.BytesIO(), "asset.zip")
+
     def test_custom_github_mirror_is_tried_before_official_and_builtins(self) -> None:
         with mock.patch.dict(
             dw.os.environ,
@@ -320,13 +408,17 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertTrue(dw.is_domestic_url("https://example.cn/video"))
         self.assertFalse(dw.is_domestic_url("https://www.youtube.com/watch?v=x"))
 
-    def test_direct_browser_cookie_args_are_explicit(self) -> None:
-        policy = dw.RequestPolicy(direct=True, cookie_mode="browser")
-        with mock.patch.object(dw, "IS_WINDOWS", True):
-            args = dw.ytdlp_base_args(policy, "https://www.xinpianchang.com/a123")
+    def test_direct_mode_never_reads_browser_cookie_database(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="none")
+        args = dw.ytdlp_base_args(policy, "https://www.douyin.com/video/123")
         self.assertEqual(args[args.index("--proxy") + 1], "")
-        self.assertEqual(args[args.index("--cookies-from-browser") + 1], "chrome")
-        self.assertEqual(args[args.index("--impersonate") + 1], "chrome:windows-10")
+        self.assertNotIn("--cookies-from-browser", args)
+
+    def test_cookie_menu_enter_defaults_to_manual_file(self) -> None:
+        with mock.patch.object(dw, "cookie_file_available", return_value=True), mock.patch(
+            "builtins.input", return_value=""
+        ):
+            self.assertEqual(dw.choose_cookie_mode(["https://www.douyin.com/video/123"]), "file")
 
     def test_xinpianchang_impersonation_also_applies_to_manual_cookies(self) -> None:
         policy = dw.RequestPolicy(direct=True, cookie_mode="file")
@@ -338,41 +430,38 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertEqual(args[args.index("--cookies") + 1], str(dw.COOKIE_FILE))
 
     def test_proxy_retry_requires_confirmation(self) -> None:
-        policy = dw.RequestPolicy(
-            direct=True,
-            cookie_mode="browser",
-            browser_refresh_attempted=True,
-        )
+        policy = dw.RequestPolicy(direct=True, cookie_mode="none")
         failure = dw.DwError("读取失败", "HTTP Error 403: Forbidden")
         with mock.patch.object(dw, "ask_yes_no", return_value=False) as ask:
             self.assertIsNone(dw.next_request_policy("https://www.xinpianchang.com/a1", policy, failure))
         ask.assert_called_once_with("是否使用系统代理重试", default=False)
 
-    def test_xinpianchang_browser_verification_can_be_retried_once(self) -> None:
-        policy = dw.RequestPolicy(direct=True, cookie_mode="browser")
+    def test_xinpianchang_failure_explains_manual_cookie_refresh(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="file")
         failure = dw.DwError("读取失败", "HTTP Error 403: Forbidden")
-        with mock.patch.object(dw, "ask_yes_no", return_value=True) as ask:
+        with mock.patch.object(dw, "ask_yes_no", return_value=False) as ask, mock.patch.object(
+            dw, "warn"
+        ) as warning:
             replacement = dw.next_request_policy(
                 "https://www.xinpianchang.com/a12303964",
                 policy,
                 failure,
             )
-        self.assertIsNotNone(replacement)
-        self.assertTrue(replacement.browser_refresh_attempted)
-        ask.assert_called_once_with("完成后是否使用更新的 Chrome Cookies 重试", default=False)
+        self.assertIsNone(replacement)
+        ask.assert_called_once_with("是否使用系统代理重试", default=False)
+        self.assertTrue(any("重新导出" in call.args[0] for call in warning.call_args_list))
 
-    def test_cookie_failure_can_upgrade_manual_mode_with_consent(self) -> None:
+    def test_cookie_failure_does_not_retry_with_unreliable_browser_database(self) -> None:
         policy = dw.RequestPolicy(direct=True, cookie_mode="file")
         failure = dw.DwError("读取失败", "Fresh cookies needed")
-        with mock.patch.object(dw, "ask_yes_no", return_value=True) as ask:
+        with mock.patch.object(dw, "ask_yes_no") as ask:
             replacement = dw.next_request_policy(
                 "https://www.douyin.com/video/123",
                 policy,
                 failure,
             )
-        self.assertIsNotNone(replacement)
-        self.assertEqual(replacement.cookie_mode, "browser")
-        ask.assert_called_once_with("是否同意本次任务临时读取 Chrome Cookies 后重试", default=False)
+        self.assertIsNone(replacement)
+        ask.assert_not_called()
 
     def test_dependency_asset_layouts(self) -> None:
         with mock.patch.object(dw, "IS_WINDOWS", True):
@@ -411,7 +500,7 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["taskkill.exe", "/PID", "4321", "/T", "/F"])
 
     def test_instance_lock_rejects_a_second_instance(self) -> None:
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+        with writable_test_directory() as temp:
             root = Path(temp)
             with mock.patch.multiple(
                 dw,
@@ -427,11 +516,12 @@ class PlatformSupportTests(unittest.TestCase):
                             pass
 
     def test_windows_cleanup_is_started_with_exact_managed_paths(self) -> None:
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+        with writable_test_directory() as temp:
             root = Path(temp)
             app = root / "app"
             command = app / "command"
             state = root / "state"
+            alias = root / "WindowsApps" / "dw.cmd"
             helper = app / "uninstall-windows.ps1"
             app.mkdir()
             helper.write_text("# dw-managed-windows-cleanup\n", encoding="utf-8")
@@ -440,6 +530,7 @@ class PlatformSupportTests(unittest.TestCase):
                 APP_DIR=app,
                 STATE_DIR=state,
                 COMMAND_DIR=command,
+                WINDOWS_ALIAS_LAUNCHER=alias,
                 WINDOWS_UNINSTALL_HELPER=helper,
             ), mock.patch.object(dw.shutil, "which", return_value="powershell.exe"), mock.patch.object(
                 dw.subprocess, "Popen"
@@ -450,6 +541,7 @@ class PlatformSupportTests(unittest.TestCase):
             self.assertEqual(arguments[arguments.index("-AppDir") + 1], str(app))
             self.assertEqual(arguments[arguments.index("-StateDir") + 1], str(state))
             self.assertEqual(arguments[arguments.index("-CommandDir") + 1], str(command))
+            self.assertEqual(arguments[arguments.index("-AliasLauncher") + 1], str(alias))
 
 
 class FilesystemSafetyTests(unittest.TestCase):
@@ -500,7 +592,7 @@ class FilesystemSafetyTests(unittest.TestCase):
 
     def test_manifest_rejects_paths_outside_output_directory(self) -> None:
         old_output = dw.OUTPUT_DIR
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+        with writable_test_directory() as temp:
             dw.OUTPUT_DIR = Path(temp)
             path, reason = dw.manifest_owned_file({"path": str(Path(temp).parent / "other.mp4")})
             self.assertIsNone(path)
@@ -509,7 +601,7 @@ class FilesystemSafetyTests(unittest.TestCase):
 
     def test_manifest_detects_replaced_inode(self) -> None:
         old_output = dw.OUTPUT_DIR
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+        with writable_test_directory() as temp:
             dw.OUTPUT_DIR = Path(temp)
             owned = Path(temp) / "video.mp4"
             owned.write_bytes(b"video")
@@ -522,7 +614,7 @@ class FilesystemSafetyTests(unittest.TestCase):
         dw.OUTPUT_DIR = old_output
 
     def test_exclusive_move_never_overwrites_existing_file(self) -> None:
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temp:
+        with writable_test_directory() as temp:
             root = Path(temp)
             source = root / "source.mp4"
             destination = root / "destination.mp4"

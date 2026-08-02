@@ -10,17 +10,18 @@
 |---|---|
 | 支持网站 | 面向当前 yt-dlp 支持的网站；普通视频、播放列表和直播使用同一个入口 |
 | 分享文案 | 可直接粘贴小红书、抖音等平台的完整分享文案；自动提取、规范化和去重链接，多链接可多选 |
-| 视频选择 | 完整列出真实、可播放的视频流，区分纯视频与自带音频的视频，并按容器和清晰度排序 |
+| 视频选择 | 完整列出真实、可播放的视频流，区分纯视频与自带音频的视频；按容器、编码和预计大小排序 |
 | 音频选择 | 列出语言、编码、码率、声道、采样率和大小；支持选择一条或多条语言音轨 |
 | 文件容器 | 每次选择自动、MP4、MKV 或 WebM；不转码，不兼容时要求重新选择并推荐 MKV |
 | 播放列表 | 分页显示项目，支持单选、多选、范围和全部；第一项的规则可自动应用到后续项目 |
 | 图片 | 列出并去重所有可下载缩略图，支持多选或全部下载，最终统一保存为 PNG |
-| Cookies | 每次任务可选“智能临时读取 Chrome”、“手动 `cookies.txt`”或“不使用”；必须由用户明确授权 |
+| Cookies | 每次任务可选“手动 `cookies.txt`”或“不使用”；直接回车默认使用固定位置的手动文件 |
+| 标签与水印源 | 最终无损重封装会删除容器元数据/平台标签；存在干净流时自动排除 yt-dlp 明确标记的带水印流 |
 | 网络策略 | 国内网站优先强制直连；直连失败后才询问是否使用系统代理，不静默切换 |
 | GitHub 容错 | 官方源不可用时可回退至 jsDelivr 和多个第三方加速源；支持用户自定义 HTTPS 镜像 |
 | 直播 | 可录制正在直播、即将开始或持续直播的内容；支持安全停止与强制取消 |
 | 输出与清理 | Windows 保存到 Downloads，Debian 保存到 `/root`；同名自动改名，失败或取消时按任务清理 |
-| 依赖与卸载 | 自动安装或更新 yt-dlp nightly、Deno、FFmpeg；提供带清单保护的完整卸载功能 |
+| 依赖与卸载 | 自动安装或更新 yt-dlp nightly、Deno、FFmpeg，实时显示百分比、已下载大小和速度；提供带清单保护的完整卸载功能 |
 
 ## 快速安装
 
@@ -59,7 +60,9 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestM
 dw
 ```
 
-如果当前终端还找不到命令，请关闭并重新打开终端。Windows 的安装、使用、Cookies、更新、卸载和故障处理详见 [Windows 10/11 完整说明](docs/WINDOWS.md)。
+安装 Python、yt-dlp、Deno 和 FFmpeg 时会实时显示类似 `45.2% | 38.6 MiB / 85.4 MiB | 5.1 MiB/s` 的进度。服务器不提供总大小时，仍会显示已下载大小和速度。
+
+安装器还会在 Windows 已有的 `%LOCALAPPDATA%\Microsoft\WindowsApps` 中创建一个受管理的 `dw.cmd` 即时别名，因此已经打开的 Windows Terminal 新标签页也不需要手动执行 `$env:Path += ...`。如果该位置已有不属于 `dw` 的同名文件，安装器不会覆盖，并会显示可直接运行的完整入口。Windows 的安装、使用、Cookies、更新、卸载和故障处理详见 [Windows 10/11 完整说明](docs/WINDOWS.md)。
 
 ### Debian 12/13 x86_64
 
@@ -152,21 +155,21 @@ dw
 
 ```text
 Cookies 使用方式：
-1. 同意智能读取 Chrome Cookies（推荐，仅本次任务）
-2. 使用我手动上传的 cookies.txt
-3. 不使用 Cookies
-请选择 Cookies 使用方式：
+1. 使用我手动上传的 cookies.txt（默认）
+2. 不使用 Cookies
+请选择 Cookies 使用方式 [直接回车默认 1]：
 ```
 
-- 选 `1`：只在本次任务内调用 yt-dlp 临时读取本机 Chrome，浏览器按域名规则将对应 Cookies 用于当前网站。`dw` 不导出、不上传、不持久保存这些 Cookies；
-- 选 `2`：使用 Windows `%USERPROFILE%\cookies.txt` 或 Debian `/root/cookies.txt`；文件不存在时会要求先上传；
-- 选 `3`：本次任务完全不使用 Cookies。
+- 直接按回车或选 `1`：使用 Windows `%USERPROFILE%\cookies.txt` 或 Debian `/root/cookies.txt`；文件不存在时会要求先上传；
+- 选 `2`：本次任务完全不使用 Cookies。
+
+Windows 上 yt-dlp 的 Chrome 数据库复制功能存在长期未解决的权限/锁定问题；即使关闭浏览器也可能出现 `Could not copy Chrome cookie database`。为避免把不可靠选项继续推荐给用户，交互菜单已移除智能读取 Chrome，统一使用可检查、可替换的 Netscape `cookies.txt`。
 
 选择完成后才会读取链接。普通单视频直接进入格式选择；播放列表先选项目；直播先询问是否录制。
 
 ### 第三步：选择视频版本
 
-视频表格会按 MP4、WebM、其他容器分组，每组由高到低排列。每一行都会显示脚本编号、`纯视频`/`视频+音频`、分辨率、帧率、编码、HDR、码率、大小和 yt-dlp 格式 ID。
+视频表格会按 MP4、WebM、其他容器分组。每组内先按编码排列（H.264 优先），同一编码再按预计大小从大到小排列，未知大小排在该编码的后面，并用分辨率、帧率和码率继续排序。每一行都会显示脚本编号、`纯视频`/`视频+音频`、分辨率、帧率、编码、HDR、码率、大小和 yt-dlp 格式 ID。
 
 这里只能输入一个脚本编号，例如：
 
@@ -205,7 +208,7 @@ Cookies 使用方式：
 4. WebM
 ```
 
-同时会显示推荐容器。输入 `1` 可让程序按所选编码自动决定；希望指定容器时输入 `2`、`3` 或 `4`。`dw` 不进行转码，如果编码不能直接放进 MP4 或 WebM，会说明原因并重新显示选择菜单；此时通常选择 `3`（MKV）。
+同时会显示推荐容器。直接按回车默认选 `1`，让程序按所选编码自动决定；希望指定容器时输入 `2`、`3` 或 `4`。`dw` 不进行转码，如果编码不能直接放进 MP4 或 WebM，会说明原因并重新显示选择菜单；此时通常选择 `3`（MKV）。
 
 ### 第六步：决定是否下载图片
 
@@ -271,7 +274,7 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 dw
 请选择：1
 请粘贴下载链接或完整分享文案：https://example.com/video
-请选择 Cookies 使用方式：1
+请选择 Cookies 使用方式 [直接回车默认 1]：
 请选择一个视频编号：2
 所选视频自带音频，是否使用它 [Y/n]：n
 请选择音频编号（多个用逗号，全部输入 a）：1,3
@@ -295,9 +298,7 @@ dw
 
 ### 使用 Cookies 下载登录内容
 
-推荐在任务中选择 `1. 同意智能读取 Chrome Cookies`。请先确保 Chrome 中能正常播放目标页面；选择后 yt-dlp 会直接读取 Chrome 的本地 Cookie 数据库，再由标准 Cookie 域名/路径规则自动匹配当前站点。若 Chrome 正在锁定数据库而读取失败，请保存浏览器中的工作后退出 Chrome，再重试。
-
-如果选择 `2. 使用我手动上传的 cookies.txt`，需在运行 `dw` 前将 Netscape 格式文件保存到固定路径。
+运行 `dw` 前，将 Netscape 格式的 `cookies.txt` 保存到固定路径。Cookies 菜单直接按回车即可使用该文件。
 
 Windows PowerShell：
 
@@ -314,7 +315,7 @@ chmod 600 /root/cookies.txt
 dw
 ```
 
-程序显示 `已发现并启用 cookies`才表示手动文件已被使用。无论哪种方式，Cookies 都等同于登录凭据：不要上传到 GitHub、网盘或发送给他人。
+程序显示 `已发现并启用 cookies` 才表示手动文件已被使用。Cookies 等同于登录凭据：不要上传到 GitHub、网盘或发送给他人。
 
 ### 更新程序与进入卸载
 
@@ -338,7 +339,7 @@ dw
 - Debian 在缺失时通过 APT 安装最小引导依赖（Python 3、CA 证书）；
 - 安装并校验 yt-dlp nightly、Deno、FFmpeg 和 FFprobe 的官方发布文件；
 - 将应用、便携依赖、缓存、任务和清单放在平台专用目录；
-- 创建 `dw` 命令；Windows 只修改当前用户 PATH，Debian 创建 `/usr/local/bin/dw`。
+- 创建 `dw` 命令；Windows 写入当前用户 PATH，并在既有 WindowsApps 命令目录创建受管理的即时别名；Debian 创建 `/usr/local/bin/dw`。
 
 下载的发布文件都要通过发布方提供的 SHA-256 校验后才会替换现有组件。更新失败但旧组件仍可使用时，`dw` 会明确警告并继续使用旧版本。
 
@@ -377,11 +378,18 @@ dw
 1. MP4 格式组；
 2. WebM 格式组；
 3. 其他容器格式组；
-4. 每组内部按分辨率、帧率、码率和预计大小从高到低排序。
+4. 每组内部 H.264 优先，其后为 H.265、AV1、VP9、VP8 和其他编码；
+5. 同一编码内按预计大小从高到低，大小未知时再按分辨率、帧率和码率排序。
 
 相同分辨率但编码、帧率、HDR 或码率不同的格式不会被合并或隐藏。
 
 如果选择的视频已经带有音频，`dw` 会询问是否保留。选择不保留时，最终文件会删除原音轨，只留下随后选择的独立音轨。
+
+## 平台标签与画面水印
+
+下载完成后，`dw` 会用 FFmpeg 做一次 `-c copy` 无损重封装，删除容器元数据、章节、封面附件和平台标签，不重新编码音视频。yt-dlp 如果把某个候选流明确标记为 `watermarked`，且同一链接还提供干净流，`dw` 会隐藏带水印候选并只让用户选择干净流；这能避免抖音/TikTok 的 `download_addr` 水印版本因文件更大而排到前面。
+
+如果文字或图案已经烧进每一帧画面，它就是视频内容的一部分，无法通过删标签或无损封装去除。小红书、Bilibili 或上传者本身烧入的可见水印只有裁剪、模糊、修复等重新编码方案，位置还可能移动；当前版本遵守“不转码”规则，不会假装已经清除这类画面水印。如果遇到这种情况，请提供一张能看清水印位置的截图，再决定是否单独增加有损处理模式。
 
 ## 音频与多语言
 
@@ -454,11 +462,10 @@ a          # 全部
 
 ## Cookies
 
-每次开始下载时都需要主动选择 Cookies 策略，不会默认读取浏览器：
+每次开始下载时提供两种策略，不会直接访问浏览器数据库：
 
-1. **智能读取 Chrome（推荐）**：只在本次任务中通过 yt-dlp 读取本机 Chrome，按当前 URL 匹配 Cookies；`dw` 不会导出或持久保存浏览器 Cookies。
-2. **手动 `cookies.txt`**：从下表的固定路径读取 Netscape 格式文件。
-3. **不使用 Cookies**：适合公开且无验证的内容。
+1. **手动 `cookies.txt`（默认）**：从下表的固定路径读取 Netscape 格式文件，菜单直接回车即选中。
+2. **不使用 Cookies**：适合公开且无验证的内容。
 
 手动文件路径：
 
@@ -473,9 +480,9 @@ Debian 建议限制权限：
 chmod 600 /root/cookies.txt
 ```
 
-手动文件存在时会显示“已发现并启用 cookies”；不存在时会显示“未检测到 cookies”并要求重新选择。错误明确指向登录会话或 Cookies 时，程序会建议重新登录 Chrome 或更新手动文件；无法确定时保留 yt-dlp 的实际失败原因，不会武断归因。
+手动文件存在时会显示“已发现并启用 cookies”；不存在时会显示“未检测到 cookies”并要求重新选择。错误明确指向登录会话或 Cookies 时，程序会建议重新导出并更新手动文件；无法确定时保留 yt-dlp 的实际失败原因，不会武断归因。
 
-新片场首次访问如果出现页面勾选/验证，请先在 Chrome 中打开原链接并完成验证。若 `dw` 仍收到 403，会说明此操作并询问是否用更新后的 Chrome Cookies 重试。
+新片场首次访问如果出现页面勾选/验证，请先在 Chrome 中打开原链接并完成验证，然后重新导出 `cookies.txt`。若 `dw` 仍收到 403，会保留实际错误，并在直连失败后询问是否使用系统代理重试。
 
 `cookies.txt` 含有敏感登录凭据，不要上传到本仓库或发送给他人。
 
@@ -587,7 +594,7 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 - 删除清单中由 `dw` 创建且仍位于原路径的全部视频和图片；
 - 使用设备号和 inode 检查文件是否已被替换，避免误删同名新文件；
 - 不搜索或删除用户手动移动、改名的文件；
-- Windows 删除 `%LOCALAPPDATA%\yt-dlp-dw`、`%LOCALAPPDATA%\yt-dlp-dw-data` 和当前用户 PATH 项；
+- Windows 删除 `%LOCALAPPDATA%\yt-dlp-dw`、`%LOCALAPPDATA%\yt-dlp-dw-data`、受管理的 WindowsApps 即时别名和当前用户 PATH 项；
 - Debian 删除 `/opt/dw`、`/var/lib/dw`、`/usr/local/bin/dw`，并移除安装器确认新增的软件包；
 - Debian 不执行全局 `apt autoremove`，不清理公共 APT 索引、缓存或系统日志；
 - 单独询问是否删除当前平台固定位置的 `cookies.txt`，默认保留；
@@ -606,6 +613,7 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 | `%LOCALAPPDATA%\yt-dlp-dw\python\` | 隔离的官方嵌入式 Python |
 | `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe |
 | `%LOCALAPPDATA%\yt-dlp-dw\command\dw.cmd` | 命令入口，加入当前用户 PATH |
+| `%LOCALAPPDATA%\Microsoft\WindowsApps\dw.cmd` | 受管理的即时命令别名；卸载时一并删除 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\cache\` | 专用缓存 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\tasks\` | 下载事务临时目录 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\downloads.json` | 卸载使用的下载文件清单 |
@@ -639,15 +647,19 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 
 ### 网站突然不能下载怎么办？
 
-先再次运行 `dw`，依赖检查到期后会更新 yt-dlp nightly。若仍失败，查看程序保留的 yt-dlp 实际错误；登录内容可改选“智能读取 Chrome Cookies”，或更新 Windows `%USERPROFILE%\cookies.txt` / Debian `/root/cookies.txt`。
+先再次运行 `dw`，依赖检查到期后会更新 yt-dlp nightly。若仍失败，查看程序保留的 yt-dlp 实际错误；登录内容请重新导出并更新 Windows `%USERPROFILE%\cookies.txt` / Debian `/root/cookies.txt`。
 
 ### 抖音精选页或完整分享口令怎么输入？
 
-直接粘贴全部文案，不需要手动删除前后文字。`dw` 会保留 `v.douyin.com` 短链接，并将 `https://www.douyin.com/jingxuan?modal_id=<数字>` 转换为 yt-dlp 可识别的 `/video/<数字>` 链接。抖音如提示 `Fresh cookies needed`，请在 Chrome 中登录并选择智能 Cookies。
+直接粘贴全部文案，不需要手动删除前后文字。`dw` 会保留 `v.douyin.com` 短链接，并将 `https://www.douyin.com/jingxuan?modal_id=<数字>` 转换为 yt-dlp 可识别的 `/video/<数字>` 链接。抖音如提示 `Fresh cookies needed`，请在 Chrome 中登录后重新导出 `%USERPROFILE%\cookies.txt`。
 
 ### 新片场链接返回 403 怎么办？
 
-先用 Chrome 打开同一链接，完成首次访问的页面勾选/验证，确认页面能播放，然后在 `dw` 选择智能 Chrome Cookies。若首次请求仍为 403，程序会询问是否在完成验证后重读 Cookies；直连仍失败时才会询问是否改用系统代理。
+先用 Chrome 打开同一链接，完成首次访问的页面勾选/验证并确认页面能播放，然后重新导出固定位置的 `cookies.txt`。再次运行链接后若直连仍失败，程序才会询问是否改用系统代理。
+
+### 为什么下载后仍能看到 Bilibili、小红书或上传者水印？
+
+先确认它是文件属性中的标签，还是画面里的文字/图案。文件标签会在最终无损重封装时删除；烧进画面的内容不能在“不转码”前提下无损去掉。请截取一帧并标出水印位置，才能评估裁剪、模糊或修复等有损方案。
 
 ### 明明关闭了代理参数，国内站点为什么仍走 Clash/v2rayN？
 

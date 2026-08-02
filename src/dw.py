@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
     msvcrt = None
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 IS_WINDOWS = os.name == "nt"
 
 
@@ -96,6 +96,12 @@ if IS_WINDOWS:
     COOKIE_FILE = Path(os.environ.get("DW_COOKIE_FILE", str(_USER_HOME / "cookies.txt")))
     COMMAND_DIR = Path(os.environ.get("DW_COMMAND_DIR", str(APP_DIR / "command")))
     LAUNCHER_PATH = Path(os.environ.get("DW_LAUNCHER_PATH", str(COMMAND_DIR / "dw.cmd")))
+    WINDOWS_ALIAS_LAUNCHER = Path(
+        os.environ.get(
+            "DW_ALIAS_LAUNCHER",
+            str(_LOCAL_APP_DATA / "Microsoft" / "WindowsApps" / "dw.cmd"),
+        )
+    )
 else:
     APP_DIR = Path(os.environ.get("DW_APP_DIR", "/opt/dw"))
     STATE_DIR = Path(os.environ.get("DW_STATE_DIR", "/var/lib/dw"))
@@ -103,6 +109,7 @@ else:
     COOKIE_FILE = Path(os.environ.get("DW_COOKIE_FILE", "/root/cookies.txt"))
     LAUNCHER_PATH = Path(os.environ.get("DW_LAUNCHER_PATH", "/usr/local/bin/dw"))
     COMMAND_DIR = LAUNCHER_PATH.parent
+    WINDOWS_ALIAS_LAUNCHER = LAUNCHER_PATH
 
 BIN_DIR = APP_DIR / "bin"
 _EXECUTABLE_SUFFIX = ".exe" if IS_WINDOWS else ""
@@ -174,17 +181,11 @@ DOMESTIC_DOMAIN_SUFFIXES = {
     "youku.com",
     "zhihu.com",
 }
-COOKIE_RETRY_DOMAIN_SUFFIXES = {
-    "douyin.com",
-    "rednote.com",
-    "xhslink.com",
-    "xiaohongshu.com",
-    "xinpianchang.com",
-}
 URL_END_CHARACTERS = "\t\r\n <>\"'`()[]{}，。！？；、【】（）《》〈〉「」『』〔〕［］"
 _WARNED_CUSTOM_MIRRORS: set[str] = set()
 
 VIDEO_CONTAINER_ORDER = {"mp4": 0, "webm": 1}
+VIDEO_CODEC_ORDER = {"h264": 0, "h265": 1, "av1": 2, "vp9": 3, "vp8": 4}
 SUPPORTED_REMUX_CONTAINERS = {"avi", "flv", "mkv", "mov", "mp4", "webm"}
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -229,8 +230,6 @@ class RequestPolicy:
 
     direct: bool = False
     cookie_mode: str = "none"
-    browser: str = "chrome"
-    browser_refresh_attempted: bool = False
 
 
 @dataclasses.dataclass
@@ -390,29 +389,6 @@ def is_domestic_url(url: str) -> bool:
     return bool(hostname) and (hostname.endswith(".cn") or hostname_matches(hostname, DOMESTIC_DOMAIN_SUFFIXES))
 
 
-def browser_cookie_retry_recommended(url: str, detail: str) -> bool:
-    lowered = detail.lower()
-    cookie_markers = (
-        "fresh cookies",
-        "cookies are no longer valid",
-        "cookie file is not valid",
-        "cookies have expired",
-        "login required",
-        "sign in",
-        "authentication required",
-        "not a bot",
-    )
-    if any(marker in lowered for marker in cookie_markers):
-        return True
-    return hostname_matches(url_hostname(url), COOKIE_RETRY_DOMAIN_SUFFIXES) and any(
-        marker in lowered
-        for marker in (
-            "http error 403",
-            "403: forbidden",
-        )
-    )
-
-
 def system_proxy_configured() -> bool:
     with contextlib.suppress(OSError, ValueError):
         proxies = urllib.request.getproxies()
@@ -550,6 +526,66 @@ def fetch_json(url: str) -> dict[str, Any]:
     raise DwError("无法查询依赖版本。", str(last_error)) from last_error
 
 
+def response_content_length(response: Any) -> int:
+    try:
+        value = response.headers.get("Content-Length")
+        length = int(value)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return length if length > 0 else 0
+
+
+def copy_response_with_progress(response: Any, output: Any, label: str) -> int:
+    """Copy an HTTP response while showing useful progress in terminals and logs."""
+    total = response_content_length(response)
+    downloaded = 0
+    started = time.monotonic()
+    last_update = started - 1.0
+    last_width = 0
+    line_active = False
+    interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    def report(final: bool = False) -> None:
+        nonlocal last_update, last_width, line_active
+        now = time.monotonic()
+        if not final and now - last_update < (0.25 if interactive else 5.0):
+            return
+        elapsed = max(now - started, 0.001)
+        speed = format_size(downloaded / elapsed) + "/s"
+        if total:
+            percent = min(downloaded * 100 / total, 100.0)
+            message = (
+                f"下载进度 {label}：{percent:6.1f}% | "
+                f"{format_size(downloaded)} / {format_size(total)} | {speed}"
+            )
+        else:
+            message = f"下载进度 {label}：{format_size(downloaded)} | {speed}"
+        if interactive:
+            last_width = max(last_width, len(message))
+            print(f"\r  {message.ljust(last_width)}", end="\n" if final else "", flush=True)
+            line_active = not final
+        else:
+            info(f"  {message}")
+        last_update = now
+
+    try:
+        while True:
+            block = response.read(1024 * 1024)
+            if not block:
+                break
+            output.write(block)
+            downloaded += len(block)
+            report()
+        if total and downloaded != total:
+            raise OSError(f"incomplete download: received {downloaded} of {total} bytes")
+        report(final=True)
+        return downloaded
+    except BaseException:
+        if interactive and line_active:
+            print(flush=True)
+        raise
+
+
 def download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
@@ -561,7 +597,7 @@ def download_file(url: str, destination: Path) -> None:
                 with urllib.request.urlopen(request(candidate_url), timeout=90) as response, destination.open(
                     "wb"
                 ) as out:
-                    shutil.copyfileobj(response, out, length=1024 * 1024)
+                    copy_response_with_progress(response, out, destination.name)
                 if destination.stat().st_size <= 0:
                     raise OSError("downloaded file is empty")
                 if candidate_url != url:
@@ -826,9 +862,7 @@ def ytdlp_base_args(policy: RequestPolicy | None = None, url: str = "") -> list[
     ]
     if policy.direct:
         args.extend(("--proxy", ""))
-    if policy.cookie_mode == "browser":
-        args.extend(("--cookies-from-browser", policy.browser))
-    elif policy.cookie_mode == "file" and cookie_file_available():
+    if policy.cookie_mode == "file" and cookie_file_available():
         args.extend(("--cookies", str(COOKIE_FILE)))
     if IS_WINDOWS and hostname_matches(url_hostname(url), {"xinpianchang.com"}):
         args.extend(("--impersonate", "chrome:windows-10"))
@@ -1044,21 +1078,56 @@ def has_audio(fmt: dict[str, Any]) -> bool:
     return str(fmt.get("acodec") or "none").lower() not in {"", "none"}
 
 
+def video_codec_family(value: Any) -> str:
+    codec = normalized_codec(value)
+    if codec.startswith(("avc", "h264")):
+        return "h264"
+    if codec.startswith(("hev", "hvc", "h265", "bytevc1")):
+        return "h265"
+    if codec.startswith(("av01", "av1")):
+        return "av1"
+    if codec.startswith(("vp09", "vp9")):
+        return "vp9"
+    if codec.startswith(("vp08", "vp8")):
+        return "vp8"
+    return codec or "other"
+
+
+def format_is_marked_watermarked(fmt: dict[str, Any]) -> bool:
+    """Identify extractor-provided streams explicitly marked as watermarked."""
+    description = " ".join(
+        str(fmt.get(field) or "")
+        for field in ("format_note", "format", "resolution")
+    ).lower()
+    return "watermark" in description or "水印" in description
+
+
 def video_formats(info_dict: dict[str, Any]) -> list[dict[str, Any]]:
     formats = [dict(fmt) for fmt in info_dict.get("formats") or [] if isinstance(fmt, dict) and has_video(fmt)]
+    # yt-dlp labels known watermarked variants (for example TikTok/Douyin's
+    # download_addr) and gives clean playback streams a better preference.  Our
+    # interactive sort must preserve that safety property instead of moving a
+    # larger watermarked variant above a clean one.
+    clean_formats = [fmt for fmt in formats if not format_is_marked_watermarked(fmt)]
+    if clean_formats:
+        formats = clean_formats
 
     def sort_key(fmt: dict[str, Any]) -> tuple[Any, ...]:
         ext = str(fmt.get("ext") or "other").lower()
         group = VIDEO_CONTAINER_ORDER.get(ext, 2)
         other = "" if group < 2 else ext
+        codec_family = video_codec_family(fmt.get("vcodec"))
+        codec_group = VIDEO_CODEC_ORDER.get(codec_family, len(VIDEO_CODEC_ORDER))
         return (
             group,
             other,
+            codec_group,
+            "" if codec_group < len(VIDEO_CODEC_ORDER) else codec_family,
+            -numeric(media_size(fmt)),
             -numeric(fmt.get("height")),
             -numeric(fmt.get("width")),
             -numeric(fmt.get("fps")),
             -numeric(fmt.get("tbr") or fmt.get("vbr")),
-            -numeric(media_size(fmt)),
             str(fmt.get("format_id") or ""),
         )
 
@@ -1096,7 +1165,9 @@ def codec_short(value: Any) -> str:
 
 
 def display_video_formats(formats: list[dict[str, Any]]) -> None:
-    info("\n可用视频版本（同容器内按分辨率、帧率、码率降序）：")
+    info("\n可用视频版本（MP4、WebM、其他；组内 H.264 优先，并按编码和预计大小降序）：")
+    if formats and all(format_is_marked_watermarked(fmt) for fmt in formats):
+        warn("该网站只返回了明确标记为带画面水印的视频流；无损封装无法删除已烧进画面的水印。")
     last_ext = None
     for index, fmt in enumerate(formats, 1):
         ext = str(fmt.get("ext") or "其他").upper()
@@ -1238,7 +1309,8 @@ def ask_container(video: dict[str, Any], audios: list[dict[str, Any]], use_embed
         info("3. MKV")
         info("4. WebM")
         info(f"推荐：{recommendation.upper()}")
-        mode = choices.get(input("请选择 [1-4]：").strip())
+        choice = input("请选择 [1-4，直接回车默认 1]：").strip() or "1"
+        mode = choices.get(choice)
         if mode is None:
             warn("请输入 1、2、3 或 4。")
             continue
@@ -1883,8 +1955,9 @@ def normalize_external_audio(path: Path, selection: ItemSelection) -> Path:
 
 
 def ensure_final_container(path: Path, selection: ItemSelection) -> Path:
-    if path.suffix.lower().lstrip(".") == selection.resolved_container:
-        return path
+    # Always perform one stream-copy remux, even when the extension already
+    # matches.  This strips container metadata, chapters, cover attachments and
+    # platform tags without re-encoding the audio or video streams.
     target = path.with_name(f"remuxed-{uuid.uuid4().hex}.{selection.resolved_container}")
     result = subprocess.run(
         [
@@ -1915,7 +1988,7 @@ def ensure_final_container(path: Path, selection: ItemSelection) -> Path:
     if result.returncode != 0:
         with contextlib.suppress(FileNotFoundError):
             target.unlink()
-        raise DwError("无法无损封装为所选容器。", result.stderr)
+        raise DwError("无法无损整理并封装为所选容器。", result.stderr)
     path.unlink()
     return target
 
@@ -2124,51 +2197,26 @@ def wait_for_upcoming(url: str, policy: RequestPolicy | None = None) -> dict[str
         raise DownloadAborted from exc
 
 
-def chrome_profile_present() -> bool:
-    if IS_WINDOWS:
-        local_value = os.environ.get("LOCALAPPDATA")
-        return bool(local_value) and (Path(local_value) / "Google" / "Chrome" / "User Data").is_dir()
-    home = Path.home()
-    return any(
-        path.is_dir()
-        for path in (
-            home / ".config" / "google-chrome",
-            home / ".config" / "chromium",
-        )
-    )
-
-
 def choose_cookie_mode(urls: Sequence[str] = ()) -> str:
     info("\nCookies 使用方式：")
     hostnames = list(dict.fromkeys(url_hostname(url) for url in urls if url_hostname(url)))
     if hostnames:
         info("本次已选网站：" + "、".join(hostnames))
-    info("智能模式会由 yt-dlp 临时读取 Chrome，并按当前网站自动匹配 Cookies。")
-    browser_note = "已检测到 Chrome" if chrome_profile_present() else "未检测到 Chrome 配置"
     file_note = "已检测到文件" if cookie_file_available() else "未检测到文件"
-    info(f"1. 同意智能读取 Chrome Cookies（推荐，仅本次任务；{browser_note}）")
-    info(f"2. 使用我手动上传的 cookies.txt（{file_note}：{COOKIE_FILE}）")
-    info("3. 不使用 Cookies")
+    info(f"1. 使用我手动上传的 cookies.txt（默认；{file_note}：{COOKIE_FILE}）")
+    info("2. 不使用 Cookies")
     while True:
-        choice = input("请选择 Cookies 使用方式：").strip()
+        choice = input("请选择 Cookies 使用方式 [直接回车默认 1]：").strip() or "1"
         if choice == "1":
-            if not chrome_profile_present():
-                warn("未检测到默认 Chrome 用户配置，智能读取可能失败。")
-                if not ask_yes_no("仍要尝试智能读取 Chrome Cookies", default=False):
-                    continue
-            info("已获得授权：本次任务将由 yt-dlp 临时读取 Chrome Cookies。")
-            info("不会导出、上传或在 dw 状态目录中保存浏览器 Cookies。")
-            return "browser"
-        if choice == "2":
             if not cookie_file_available():
                 warn(f"未检测到 cookies：{COOKIE_FILE}，请上传后重新选择。")
                 continue
             info(f"已发现并启用 cookies：{COOKIE_FILE}")
             return "file"
-        if choice == "3":
+        if choice == "2":
             info("本次任务不使用 Cookies。")
             return "none"
-        warn("请输入 1、2 或 3。")
+        warn("请输入 1 或 2。")
 
 
 def initial_request_policy(url: str, cookie_mode: str) -> RequestPolicy:
@@ -2207,24 +2255,10 @@ def xinpianchang_verification_failure(url: str, detail: str) -> bool:
 def next_request_policy(url: str, policy: RequestPolicy, exc: DwError) -> RequestPolicy | None:
     detail = exc.detail or exc.message
     xinpianchang_verification = xinpianchang_verification_failure(url, detail)
-    if (
-        xinpianchang_verification
-        and policy.cookie_mode == "browser"
-        and not policy.browser_refresh_attempted
-    ):
+    if xinpianchang_verification:
         warn("新片场首次访问可能需要先在 Chrome 打开该链接并完成页面勾选/验证。")
-        if ask_yes_no("完成后是否使用更新的 Chrome Cookies 重试", default=False):
-            return dataclasses.replace(policy, browser_refresh_attempted=True)
-    if policy.cookie_mode != "browser" and browser_cookie_retry_recommended(url, detail):
-        warn("当前 Cookies 或站点验证未通过。")
-        if xinpianchang_verification:
-            warn("请先在 Chrome 打开该新片场链接，完成首次页面勾选/验证。")
-        if ask_yes_no("是否同意本次任务临时读取 Chrome Cookies 后重试", default=False):
-            return dataclasses.replace(
-                policy,
-                cookie_mode="browser",
-                browser_refresh_attempted=xinpianchang_verification,
-            )
+        if policy.cookie_mode == "file":
+            warn(f"完成验证后，请重新导出并覆盖 {COOKIE_FILE}，再重新执行当前链接。")
     if policy.direct and network_retry_recommended(detail):
         warn("国内网站直连请求失败。")
         if ask_yes_no("是否使用系统代理重试", default=False):
@@ -2242,16 +2276,14 @@ def run_with_policy_retries(url: str, policy: RequestPolicy, operation: Any) -> 
             if replacement is None:
                 raise
             current = replacement
-            if current.cookie_mode == "browser":
-                info("正在使用获准的 Chrome Cookies 重试 …")
-            elif not current.direct:
+            if not current.direct:
                 info("正在使用系统代理重试 …")
 
 
 def show_dw_error(exc: DwError) -> None:
     error(exc.message)
     if exc.cookie_related:
-        error(f"Cookies 可能已失效或与当前网站不匹配；请重新登录 Chrome 或更新 {COOKIE_FILE}。")
+        error(f"Cookies 可能已失效或与当前网站不匹配；请重新导出并更新 {COOKIE_FILE}。")
     if exc.detail:
         detail_lines = exc.detail.strip().splitlines()
         info("失败原因：")
@@ -2550,13 +2582,13 @@ def safe_owned_tree_remove(path: Path, marker_name: str = ".dw-owned") -> str | 
     return None
 
 
-def launcher_is_owned() -> bool:
-    if LAUNCHER_PATH.is_symlink():
+def launcher_is_owned(path: Path = LAUNCHER_PATH) -> bool:
+    if path.is_symlink():
         with contextlib.suppress(OSError):
-            return LAUNCHER_PATH.resolve() == APP_DIR / "dw.py"
+            return path.resolve() == APP_DIR / "dw.py"
         return False
     try:
-        return "dw-managed-launcher" in LAUNCHER_PATH.read_text(encoding="utf-8", errors="ignore")[:256]
+        return "dw-managed-launcher" in path.read_text(encoding="utf-8", errors="ignore")[:256]
     except OSError:
         return False
 
@@ -2596,6 +2628,8 @@ def schedule_windows_cleanup() -> str | None:
         str(STATE_DIR),
         "-CommandDir",
         str(COMMAND_DIR),
+        "-AliasLauncher",
+        str(WINDOWS_ALIAS_LAUNCHER),
     ]
     try:
         subprocess.Popen(
@@ -2635,6 +2669,8 @@ def uninstall() -> None:
     info(f"- 应用目录：{APP_DIR}（{app_count} 个文件，{format_size(app_size)}）")
     info(f"- 状态与缓存：{STATE_DIR}（{state_count} 个文件，{format_size(state_size)}）")
     info(f"- 命令入口：{LAUNCHER_PATH}")
+    if IS_WINDOWS and WINDOWS_ALIAS_LAUNCHER != LAUNCHER_PATH:
+        info(f"- 即时命令别名：{WINDOWS_ALIAS_LAUNCHER}")
     if IS_WINDOWS:
         info("- Windows 版使用隔离的便携依赖，不修改系统软件包")
     elif packages:

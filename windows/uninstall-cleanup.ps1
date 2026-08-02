@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][int]$ParentPid,
     [Parameter(Mandatory = $true)][string]$AppDir,
     [Parameter(Mandatory = $true)][string]$StateDir,
-    [Parameter(Mandatory = $true)][string]$CommandDir
+    [Parameter(Mandatory = $true)][string]$CommandDir,
+    [Parameter(Mandatory = $true)][string]$AliasLauncher
 )
 
 Set-StrictMode -Version 2.0
@@ -53,6 +54,25 @@ function Remove-ManagedTree([string]$Path) {
     return "$Normalized : removal did not complete"
 }
 
+function Remove-ManagedLauncher([string]$Path) {
+    $Normalized = Normalize-Path $Path
+    if (-not (Test-Path -LiteralPath $Normalized)) {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $Normalized -PathType Leaf)) {
+        return "$Normalized : command alias is not a regular file"
+    }
+    if (-not (Select-String -LiteralPath $Normalized -SimpleMatch "dw-managed-launcher" -Quiet)) {
+        return "$Normalized : command alias is no longer owned by dw"
+    }
+    try {
+        Remove-Item -LiteralPath $Normalized -Force -ErrorAction Stop
+        return $null
+    } catch {
+        return "$Normalized : $($_.Exception.Message)"
+    }
+}
+
 function Remove-UserPathEntry([string]$Path) {
     $Target = Normalize-Path $Path
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -87,8 +107,13 @@ try {
     $NormalizedApp = Normalize-Path $AppDir
     $NormalizedState = Normalize-Path $StateDir
     $NormalizedCommand = Normalize-Path $CommandDir
+    $NormalizedAlias = Normalize-Path $AliasLauncher
+    $ExpectedAlias = Normalize-Path (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\dw.cmd")
     if (-not $NormalizedCommand.StartsWith($NormalizedApp + "\", [StringComparison]::OrdinalIgnoreCase)) {
         throw "Command directory is outside the managed application directory."
+    }
+    if (-not [string]::Equals($NormalizedAlias, $ExpectedAlias, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Command alias is outside the exact managed WindowsApps location."
     }
     Assert-ManagedTree $NormalizedApp
     Assert-ManagedTree $NormalizedState
@@ -99,6 +124,10 @@ try {
     Start-Sleep -Milliseconds 300
 
     Write-Host "Completing yt-dlp-dw uninstall ..."
+    $AliasFailure = Remove-ManagedLauncher $NormalizedAlias
+    if ($AliasFailure) {
+        $Failures.Add($AliasFailure)
+    }
     $AppFailure = Remove-ManagedTree $NormalizedApp
     if ($AppFailure) {
         $Failures.Add($AppFailure)

@@ -31,6 +31,8 @@ $PythonExe = Join-Path $RuntimeDir "python.exe"
 $DwScript = Join-Path $AppDir "dw.py"
 $CleanupScript = Join-Path $AppDir "uninstall-windows.ps1"
 $Launcher = Join-Path $CommandDir "dw.cmd"
+$AliasDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+$AliasLauncher = Join-Path $AliasDir "dw.cmd"
 $AppMarker = Join-Path $AppDir ".dw-owned"
 $StateMarker = Join-Path $StateDir ".dw-owned"
 $MirrorFile = Join-Path $StateDir "github-mirrors.txt"
@@ -147,6 +149,91 @@ function Get-GithubCandidates([string]$Uri, [string]$RepositoryPath) {
     return @($Candidates | Group-Object -Property Uri | ForEach-Object { $_.Group[0] })
 }
 
+function Format-ByteSize([double]$Bytes) {
+    $Units = @("B", "KiB", "MiB", "GiB", "TiB")
+    $Index = 0
+    while ($Bytes -ge 1024 -and $Index -lt ($Units.Count - 1)) {
+        $Bytes /= 1024
+        $Index++
+    }
+    return ("{0:N1} {1}" -f $Bytes, $Units[$Index])
+}
+
+function Save-HttpFileWithProgress([string]$Uri, [string]$Destination) {
+    $Response = $null
+    $InputStream = $null
+    $OutputStream = $null
+    $LineActive = $false
+    try {
+        $Request = [Net.HttpWebRequest][Net.WebRequest]::Create($Uri)
+        $Request.AllowAutoRedirect = $true
+        $Request.UserAgent = "yt-dlp-dw-installer/1.2.1"
+        $Request.Timeout = 90000
+        $Request.ReadWriteTimeout = 90000
+        $Response = [Net.HttpWebResponse]$Request.GetResponse()
+        $InputStream = $Response.GetResponseStream()
+        $OutputStream = [IO.File]::Open(
+            $Destination,
+            [IO.FileMode]::Create,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        $Total = [long]$Response.ContentLength
+        $Downloaded = [long]0
+        $Buffer = New-Object byte[] (1024 * 1024)
+        $Timer = [Diagnostics.Stopwatch]::StartNew()
+        $LastUpdate = [long]-1000
+        $LastWidth = 0
+        $Label = [IO.Path]::GetFileName($Destination)
+
+        while (($Read = $InputStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+            $OutputStream.Write($Buffer, 0, $Read)
+            $Downloaded += $Read
+            if (($Timer.ElapsedMilliseconds - $LastUpdate) -ge 250) {
+                $Seconds = [Math]::Max($Timer.Elapsed.TotalSeconds, 0.001)
+                $Speed = (Format-ByteSize ($Downloaded / $Seconds)) + "/s"
+                if ($Total -gt 0) {
+                    $Percent = [Math]::Min(($Downloaded * 100.0 / $Total), 100.0)
+                    $Line = "Progress $Label`: $($Percent.ToString('F1'))% | $(Format-ByteSize $Downloaded) / $(Format-ByteSize $Total) | $Speed"
+                } else {
+                    $Line = "Progress $Label`: $(Format-ByteSize $Downloaded) | $Speed"
+                }
+                $LastWidth = [Math]::Max($LastWidth, $Line.Length)
+                Write-Host ("`r  " + $Line.PadRight($LastWidth)) -NoNewline
+                $LineActive = $true
+                $LastUpdate = $Timer.ElapsedMilliseconds
+            }
+        }
+        $OutputStream.Flush()
+        if ($Total -gt 0 -and $Downloaded -ne $Total) {
+            throw "incomplete download: received $Downloaded of $Total bytes"
+        }
+        $Seconds = [Math]::Max($Timer.Elapsed.TotalSeconds, 0.001)
+        $Speed = (Format-ByteSize ($Downloaded / $Seconds)) + "/s"
+        if ($Total -gt 0) {
+            $Line = "Progress $Label`: 100.0% | $(Format-ByteSize $Downloaded) / $(Format-ByteSize $Total) | $Speed"
+        } else {
+            $Line = "Progress $Label`: $(Format-ByteSize $Downloaded) | $Speed"
+        }
+        $LastWidth = [Math]::Max($LastWidth, $Line.Length)
+        Write-Host ("`r  " + $Line.PadRight($LastWidth))
+        $LineActive = $false
+    } finally {
+        if ($OutputStream) {
+            $OutputStream.Dispose()
+        }
+        if ($InputStream) {
+            $InputStream.Dispose()
+        }
+        if ($Response) {
+            $Response.Dispose()
+        }
+        if ($LineActive) {
+            Write-Host ""
+        }
+    }
+}
+
 function Get-RemoteFile(
     [string]$Uri,
     [string]$Destination,
@@ -166,7 +253,7 @@ function Get-RemoteFile(
         }
         try {
             Write-Host "Downloading $($Candidate.Uri)"
-            Invoke-WebRequest -UseBasicParsing -Uri $Candidate.Uri -OutFile $Destination -TimeoutSec 90
+            Save-HttpFileWithProgress $Candidate.Uri $Destination
             if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
                 throw "download did not create $Destination"
             }
@@ -222,6 +309,12 @@ function Install-AtomicFile([string]$Source, [string]$Destination) {
             Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Test-ManagedLauncher([string]$Path) {
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -and (
+        Select-String -LiteralPath $Path -SimpleMatch "dw-managed-launcher" -Quiet
+    )
 }
 
 function Get-NormalizedPath([string]$Path) {
@@ -355,7 +448,7 @@ try {
         [IO.File]::WriteAllLines($MirrorFile, @($WorkingCustomMirrors), [Text.UTF8Encoding]::new($false))
     }
 
-    if ((Test-Path -LiteralPath $Launcher -PathType Leaf) -and -not (Select-String -LiteralPath $Launcher -SimpleMatch "dw-managed-launcher" -Quiet)) {
+    if ((Test-Path -LiteralPath $Launcher -PathType Leaf) -and -not (Test-ManagedLauncher $Launcher)) {
         Fail "$Launcher exists and is not owned by dw."
     }
     $LauncherText = @"
@@ -371,6 +464,18 @@ set "PYTHONIOENCODING=utf-8"
     [IO.File]::WriteAllText($LauncherSource, $LauncherText, [Text.ASCIIEncoding]::new())
     Install-AtomicFile $LauncherSource $Launcher
 
+    $AliasInstalled = $false
+    if (Test-Path -LiteralPath $AliasDir -PathType Container) {
+        if ((Test-Path -LiteralPath $AliasLauncher) -and -not (Test-ManagedLauncher $AliasLauncher)) {
+            Write-Warning "$AliasLauncher already exists and is not owned by dw; it was not replaced."
+        } else {
+            Install-AtomicFile $LauncherSource $AliasLauncher
+            $AliasInstalled = $true
+        }
+    } else {
+        Write-Warning "$AliasDir is unavailable; the immediate command alias could not be installed."
+    }
+
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
     Write-Host "Installing and verifying yt-dlp, Deno, FFmpeg, and FFprobe ..."
@@ -383,7 +488,13 @@ set "PYTHONIOENCODING=utf-8"
     }
 
     Write-Host ""
-    Write-Host "Installation complete. Run: dw"
+    if ($AliasInstalled -and (Get-Command dw.cmd -ErrorAction SilentlyContinue)) {
+        Write-Host "Installation complete. The dw command is available now and in new PowerShell tabs."
+    } else {
+        Write-Host "Installation complete. Run: dw"
+        Write-Warning "If this terminal still has an old PATH, run the exact launcher below once:"
+        Write-Host "& `"$Launcher`""
+    }
     Write-Host "Application: $AppDir"
     Write-Host "State:       $StateDir"
     Write-Host "Downloads:   your Windows Downloads known folder"

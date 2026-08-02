@@ -1,6 +1,6 @@
 # Windows 10/11 使用说明
 
-本页说明如何在 Windows 10/11 x64 上安装、运行、更新和卸载 `yt-dlp-dw`。Windows 版与 Debian 版使用同一套交互逻辑，支持视频与音频版本选择、多语言音轨、播放列表、完整分享文案抽链、智能 Chrome Cookies、国内站点直连、PNG 图片和直播录制。
+本页说明如何在 Windows 10/11 x64 上安装、运行、更新和卸载 `yt-dlp-dw`。Windows 版与 Debian 版使用同一套交互逻辑，支持视频与音频版本选择、多语言音轨、播放列表、完整分享文案抽链、手动 cookies.txt、国内站点直连、PNG 图片和直播录制。
 
 ## 系统要求
 
@@ -10,7 +10,7 @@
 - 能访问至少一个 GitHub 官方/回退源、Python.org 和目标视频网站；
 - 不需要管理员权限，也不需要预先安装 Python、yt-dlp、Deno 或 FFmpeg。
 
-程序按当前 Windows 用户独立安装，不会安装系统级 Python，也不会调用 Winget、Chocolatey 或修改系统 PATH。
+程序按当前 Windows 用户独立安装，不会安装系统级 Python，也不会调用 Winget、Chocolatey 或修改机器级 PATH；只管理当前用户 PATH 和自己的命令别名。
 
 ## 一键安装
 
@@ -47,10 +47,18 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestM
 2. 下载并校验 Python 3.13 x64 官方嵌入式运行时；
 3. 安装 Windows x64 版 yt-dlp nightly、Deno、FFmpeg 和 FFprobe；
 4. 使用上游提供的 SHA-256 校验文件验证所有媒体依赖；
-5. 创建 `dw.cmd` 并把专用命令目录加入当前用户 PATH；
-6. 在当前终端中立即启用 `dw` 命令。
+5. 创建 `dw.cmd`，把专用命令目录加入当前用户 PATH；
+6. 在已有的 `%LOCALAPPDATA%\Microsoft\WindowsApps` 中创建受管理的即时别名，让当前窗口及 Windows Terminal 新标签页直接识别 `dw`。
 
-如果安装后当前终端找不到 `dw`，关闭终端并重新打开，然后再输入 `dw`。也可以直接运行：
+大文件下载会实时显示百分比、已下载/总大小和当前平均速度，例如：
+
+```text
+Progress ffmpeg.zip: 45.2% | 38.6 MiB / 85.4 MiB | 5.1 MiB/s
+```
+
+如果镜像没有返回文件总大小，安装器仍会持续显示已下载大小和速度。
+
+正常情况下，安装结束后当前窗口和新 PowerShell 标签页都能直接输入 `dw`，不需要再执行 `$env:Path += ...`。如果 WindowsApps 中已有不属于本程序的同名 `dw.cmd`，安装器会保护原文件并给出警告；此时可直接运行：
 
 ```powershell
 & "$env:LOCALAPPDATA\yt-dlp-dw\command\dw.cmd"
@@ -98,19 +106,19 @@ dw
 
 ```text
 Cookies 使用方式：
-1. 同意智能读取 Chrome Cookies（推荐，仅本次任务）
-2. 使用我手动上传的 cookies.txt
-3. 不使用 Cookies
-请选择 Cookies 使用方式：
+1. 使用我手动上传的 cookies.txt（默认）
+2. 不使用 Cookies
+请选择 Cookies 使用方式 [直接回车默认 1]：
 ```
 
-- 选 `1`：明确授权 yt-dlp 在本次任务临时读取 Chrome，并按当前网站自动匹配 Cookies。`dw` 不导出、不上传、不长期保存浏览器 Cookies；
-- 选 `2`：读取 `%USERPROFILE%\cookies.txt`，文件不存在时要求先上传；
-- 选 `3`：本次任务不使用 Cookies。
+- 直接按回车或选 `1`：读取 `%USERPROFILE%\cookies.txt`，文件不存在时要求先上传；
+- 选 `2`：本次任务不使用 Cookies。
+
+yt-dlp 在 Windows 上读取 Chrome Cookie 数据库可能长期报 `Could not copy Chrome cookie database`，并非关闭浏览器就一定能解决。因此 `dw` 不再显示这个不可靠选项，统一使用用户主动导出的 Netscape `cookies.txt`。
 
 ### 4. 选择视频
 
-视频列表按 MP4、WebM、其他格式分组，每组按分辨率、帧率和码率从高到低排列。输入一条视频前面的脚本编号：
+视频列表按 MP4、WebM、其他格式分组。每组内 H.264 优先，再按编码和预计大小从高到低排列，大小未知时使用分辨率、帧率和码率继续排序。输入一条视频前面的脚本编号：
 
 ```text
 请选择一个视频编号：3
@@ -145,7 +153,7 @@ Cookies 使用方式：
 4. WebM
 ```
 
-程序会显示推荐值。输入 `1` 让程序自动选择，或者输入 `2`、`3`、`4` 指定。程序不会转码；编码与 MP4/WebM 不兼容时会拒绝该选择并推荐 MKV。
+程序会显示推荐值。直接按回车默认选择 `1`，让程序自动决定；也可输入 `2`、`3`、`4` 指定。程序不会转码；编码与 MP4/WebM 不兼容时会拒绝该选择并推荐 MKV。
 
 ### 7. 选择图片
 
@@ -199,11 +207,7 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 
 ## Cookies
 
-推荐在任务中选择“智能读取 Chrome Cookies”。请先确保 Chrome 能正常打开/播放目标页面。选择后 yt-dlp 会读取 Chrome 的本地 Cookie 数据库，再由标准域名和路径规则为当前 URL 选用对应 Cookies。
-
-这项读取只在用户每次明确选择 `1` 后发生。`dw` 不会把浏览器 Cookies 导出到文件、上传网络或写入状态目录。若 Chrome 正在锁定 Cookie 数据库导致读取失败，保存浏览器工作后退出 Chrome，再重试。
-
-如果选择手动方式，将 Netscape 格式的 cookies 文件放在：
+将 Netscape 格式的 cookies 文件放在下面的位置，运行时在 Cookies 菜单直接按回车即可使用：
 
 ```text
 %USERPROFILE%\cookies.txt
@@ -218,7 +222,13 @@ dw
 
 只有看到“已发现并启用 cookies”才表示手动文件已使用。Cookies 等同登录凭据，请勿上传到 GitHub、网盘或发送给其他人。
 
-新片场首次访问如果需要页面勾选/验证，先在 Chrome 打开原链接并完成操作。若 `dw` 收到 403，会询问是否在完成验证后重新读取 Chrome Cookies。
+新片场首次访问如果需要页面勾选/验证，先在 Chrome 打开原链接并完成操作，然后重新导出并覆盖上述 `cookies.txt`。若直连仍失败，`dw` 会显示实际原因，再询问是否使用系统代理。
+
+## 平台标签与水印
+
+最终文件会经过一次 `-c copy` 无损重封装，容器元数据、章节、封面附件和平台标签会被删除，音视频流不会重新编码。yt-dlp 明确把某个候选流标为 `watermarked` 且还存在干净流时，`dw` 会自动隐藏带水印候选；抖音/TikTok 的水印 `download_addr` 就按此规则处理。
+
+画面本身已经包含的文字或图案无法靠删标签无损擦除。Bilibili、小红书或上传者烧进每帧画面的水印，需要裁剪、模糊或修复并重新编码，可能损失画质；当前脚本遵守“不转码”原则，不会声称已经删除这类内容。需要处理时，请先提供一张截图确认水印位置和是否移动。
 
 ## 国内站点直连与系统代理
 
@@ -286,7 +296,7 @@ dw
 
 > 完整确认后会删除清单中由 `dw` 下载且仍在原路径的全部视频和图片，不只是删除程序。需要保留的文件必须先移动或改名。
 
-卸载器会单独询问是否删除 `%USERPROFILE%\cookies.txt`，默认保留。Python 主进程退出后，PowerShell 清理器会继续删除应用、便携依赖、状态、缓存、命令入口和用户 PATH 项，并明确列出任何未能删除的路径。成功卸载不保留日志。
+卸载器会单独询问是否删除 `%USERPROFILE%\cookies.txt`，默认保留。Python 主进程退出后，PowerShell 清理器会继续删除应用、便携依赖、状态、缓存、两个受管理的命令入口和用户 PATH 项，并明确列出任何未能删除的路径。成功卸载不保留日志。
 
 卸载后应重新打开终端以刷新 PATH。手动移动或改名的成品不再属于清单原路径，程序不会搜索或猜测其新位置。
 
@@ -298,6 +308,7 @@ dw
 | `%LOCALAPPDATA%\yt-dlp-dw\python\` | 官方嵌入式 Python |
 | `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe |
 | `%LOCALAPPDATA%\yt-dlp-dw\command\dw.cmd` | `dw` 命令入口 |
+| `%LOCALAPPDATA%\Microsoft\WindowsApps\dw.cmd` | 立即生效的受管理别名，卸载时删除 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\cache\` | 专用缓存 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\tasks\` | 下载事务临时目录 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\downloads.json` | 安全卸载清单 |
@@ -313,7 +324,7 @@ dw
 
 ### 安装成功但找不到 `dw`
 
-关闭并重新打开 PowerShell、CMD 或 Windows Terminal。仍然找不到时直接运行：
+新版安装器会在 WindowsApps 命令目录创建即时别名，安装后无需手动追加 PATH。先重新运行最新版安装命令；若 WindowsApps 已有不属于 `dw` 的同名文件，安装器会保护它并报警，此时直接运行：
 
 ```powershell
 & "$env:LOCALAPPDATA\yt-dlp-dw\command\dw.cmd"
@@ -329,15 +340,19 @@ dw
 
 ### 登录内容下载失败
 
-优先确认 Chrome 中可以正常播放，然后选择智能 Chrome Cookies。手动方式则确认文件名严格为 `%USERPROFILE%\cookies.txt`、格式为 Netscape cookies。程序会保留 yt-dlp 的实际失败原因；只有错误明确指向 Cookies/登录会话时才提示更新。
+优先确认 Chrome 中可以正常播放，再重新导出 Cookies。确认文件名严格为 `%USERPROFILE%\cookies.txt`、格式为 Netscape cookies；在 `dw` 的 Cookies 菜单直接按回车。程序会保留 yt-dlp 的实际失败原因；只有错误明确指向 Cookies/登录会话时才提示更新。
 
 ### 抖音精选链接提示 Unsupported URL
 
-可直接粘贴 `https://www.douyin.com/jingxuan?modal_id=...` 或带 `v.douyin.com` 短链接的整段分享口令。`dw` 会自动提取 URL，并将数字 `modal_id` 转换为 `/video/<id>`。若提示 `Fresh cookies needed`，请选择智能 Chrome Cookies。
+可直接粘贴 `https://www.douyin.com/jingxuan?modal_id=...` 或带 `v.douyin.com` 短链接的整段分享口令。`dw` 会自动提取 URL，并将数字 `modal_id` 转换为 `/video/<id>`。若提示 `Fresh cookies needed`，请在 Chrome 登录后重新导出 `%USERPROFILE%\cookies.txt`。
 
 ### 新片场返回 403
 
-先在 Chrome 打开同一新片场链接，完成首次页面勾选/验证并确认能播放，再选择智能 Chrome Cookies。如果直连仍失败，程序会先询问是否重读更新后的 Cookies，再单独询问是否使用系统代理。
+先在 Chrome 打开同一新片场链接，完成首次页面勾选/验证并确认能播放，然后重新导出 `%USERPROFILE%\cookies.txt`。再次运行后如果直连仍失败，程序会询问是否使用系统代理。
+
+### 下载后仍能看到 Bilibili 或小红书水印
+
+文件属性里的平台标签会被最终无损重封装删除；如果水印已经出现在画面像素中，它不能在“不转码”前提下被无损去掉。请提供一张视频截图并标出位置，再评估是否值得增加会重新编码的裁剪、模糊或修复模式。
 
 ### Clash/v2rayN 开启时国内站点仍走代理
 
