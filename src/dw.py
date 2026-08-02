@@ -22,6 +22,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -49,7 +50,7 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
     msvcrt = None
 
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 IS_WINDOWS = os.name == "nt"
 
 
@@ -224,6 +225,219 @@ DOMESTIC_DOMAIN_SUFFIXES = {
 URL_END_CHARACTERS = "\t\r\n <>\"'`()[]{}，。！？；、【】（）《》〈〉「」『』〔〕［］"
 _WARNED_CUSTOM_MIRRORS: set[str] = set()
 
+XPC_CHROME_BRIDGE_SOURCE = r"""
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function readConfig() {
+  const text = await new Response(Deno.stdin.readable).text();
+  const value = JSON.parse(text);
+  if (!value || typeof value.url !== "string" || !Number.isInteger(value.port)) {
+    throw new Error("invalid bridge configuration");
+  }
+  return value;
+}
+
+async function waitForTarget(port, deadline) {
+  const endpoint = "http://127.0.0.1:" + port + "/json/list";
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(endpoint);
+      if (response.ok) {
+        const targets = await response.json();
+        const target = targets.find((item) => item.type === "page" && item.webSocketDebuggerUrl);
+        if (target) {
+          return target;
+        }
+      }
+    } catch (_) {
+      // Chrome may still be starting.
+    }
+    await delay(250);
+  }
+  throw new Error("Chrome remote debugging endpoint did not become ready");
+}
+
+async function connect(url) {
+  const socket = new WebSocket(url);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Chrome connection timed out")), 15000);
+    socket.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    socket.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("Chrome connection failed"));
+    };
+  });
+  return socket;
+}
+
+async function main() {
+  const config = await readConfig();
+  const deadline = Date.now() + Math.max(30000, Number(config.timeoutMs) || 300000);
+  const target = await waitForTarget(config.port, Math.min(deadline, Date.now() + 20000));
+  const socket = await connect(target.webSocketDebuggerUrl);
+  let sequence = 0;
+  const pending = new Map();
+
+  socket.onmessage = (event) => {
+    let message;
+    try {
+      message = JSON.parse(String(event.data));
+    } catch (_) {
+      return;
+    }
+    if (!message.id || !pending.has(message.id)) {
+      return;
+    }
+    const waiter = pending.get(message.id);
+    pending.delete(message.id);
+    clearTimeout(waiter.timer);
+    if (message.error) {
+      waiter.reject(new Error(message.error.message || "Chrome command failed"));
+    } else {
+      waiter.resolve(message.result || {});
+    }
+  };
+  socket.onclose = () => {
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error("Chrome window was closed"));
+    }
+    pending.clear();
+  };
+
+  function command(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const id = ++sequence;
+      const timer = setTimeout(() => {
+        if (pending.delete(id)) {
+          reject(new Error("Chrome command timed out: " + method));
+        }
+      }, 15000);
+      pending.set(id, {resolve, reject, timer});
+      socket.send(JSON.stringify({id, method, params}));
+    });
+  }
+
+  await command("Network.enable");
+  if (Array.isArray(config.cookies) && config.cookies.length) {
+    await command("Network.setCookies", {cookies: config.cookies});
+  }
+  await command("Page.enable");
+  await command("Page.navigate", {url: config.url});
+
+  const expression = String.raw`(() => {
+    const state = {
+      title: document.title || "",
+      url: location.href,
+      readyState: document.readyState,
+      userAgent: navigator.userAgent || ""
+    };
+    const element = document.querySelector("#__NEXT_DATA__");
+    if (!element) {
+      return state;
+    }
+    try {
+      const root = JSON.parse(element.textContent || "{}");
+      const detail = root && root.props && root.props.pageProps && root.props.pageProps.detail;
+      const video = detail && detail.video;
+      if (video && video.vid && video.appKey) {
+        state.ready = true;
+        state.vid = String(video.vid);
+        state.appKey = String(video.appKey);
+        state.title = String((detail && detail.title) || state.title || "");
+      }
+    } catch (_) {
+      state.parseError = true;
+    }
+    return state;
+  })()`;
+
+  let lastState = {};
+  let nextProgress = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const evaluated = await command("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: false
+    });
+    lastState = evaluated && evaluated.result && evaluated.result.value || {};
+    if (lastState.ready && lastState.vid && lastState.appKey) {
+      let sessionCookies = [];
+      try {
+        const cookieResult = await command("Network.getCookies", {
+          urls: [config.url, "https://mod-api.xinpianchang.com/"]
+        });
+        sessionCookies = (cookieResult.cookies || [])
+          .filter((cookie) => {
+            const domain = String(cookie.domain || "").toLowerCase().replace(/^\./, "");
+            return domain === "xinpianchang.com" || domain.endsWith(".xinpianchang.com");
+          })
+          .map((cookie) => ({
+            name: String(cookie.name || ""),
+            value: String(cookie.value || ""),
+            domain: String(cookie.domain || ""),
+            path: String(cookie.path || "/"),
+            secure: Boolean(cookie.secure),
+            httpOnly: Boolean(cookie.httpOnly),
+            expires: Number(cookie.expires) || 0
+          }));
+      } catch (_) {
+        // The public media API often needs no session cookie. Continue safely.
+      }
+      console.log(JSON.stringify({
+        ok: true,
+        vid: lastState.vid,
+        appKey: lastState.appKey,
+        title: lastState.title || "",
+        userAgent: lastState.userAgent || "",
+        cookies: sessionCookies
+      }));
+      try {
+        socket.send(JSON.stringify({id: ++sequence, method: "Browser.close", params: {}}));
+        await delay(250);
+      } catch (_) {
+        // Python still owns and terminates the browser process as a fallback.
+      }
+      try {
+        socket.close();
+      } catch (_) {
+        // Browser.close may already have closed the DevTools socket.
+      }
+      return;
+    }
+    if (Date.now() >= nextProgress) {
+      console.error("仍在等待你完成新片场页面验证，请在打开的 Chrome 窗口中操作 …");
+      nextProgress = Date.now() + 15000;
+    }
+    await delay(1000);
+  }
+  try {
+    socket.send(JSON.stringify({id: ++sequence, method: "Browser.close", params: {}}));
+    await delay(250);
+  } catch (_) {
+    // Python still performs process cleanup after the helper exits.
+  }
+  try {
+    socket.close();
+  } catch (_) {
+    // Browser may already be closed by the user.
+  }
+  throw new Error(
+    "等待页面验证超时" + (lastState.title ? "；当前页面：" + lastState.title : "")
+  );
+}
+
+try {
+  await main();
+} catch (error) {
+  console.error("Chrome 辅助读取失败：" + (error && error.message ? error.message : String(error)));
+  Deno.exit(1);
+}
+"""
+
 VIDEO_CONTAINER_ORDER = {"mp4": 0, "webm": 1}
 VIDEO_CODEC_ORDER = {"h264": 0, "h265": 1, "av1": 2, "vp9": 3, "vp8": 4}
 SUPPORTED_REMUX_CONTAINERS = {"avi", "flv", "mkv", "mov", "mp4", "webm"}
@@ -270,6 +484,8 @@ class RequestPolicy:
 
     direct: bool = False
     cookie_mode: str = "none"
+    xpc_info: dict[str, Any] | None = dataclasses.field(default=None, compare=False, repr=False)
+    xpc_assist_attempted: bool = False
 
 
 @dataclasses.dataclass
@@ -947,6 +1163,523 @@ def ytdlp_base_args(policy: RequestPolicy | None = None, url: str = "") -> list[
     return args
 
 
+def is_xinpianchang_url(url: str) -> bool:
+    return hostname_matches(url_hostname(url), {"xinpianchang.com"})
+
+
+def chrome_executable_path() -> Path | None:
+    """Locate stable Chrome without reading its profile or cookie database."""
+    if not IS_WINDOWS:
+        return None
+    candidates: list[Path] = []
+    configured = os.environ.get("DW_CHROME_PATH")
+    if configured:
+        candidates.append(Path(configured))
+    for variable in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    discovered = shutil.which("chrome.exe") or shutil.which("chrome")
+    if discovered:
+        candidates.append(Path(discovered))
+    for candidate in candidates:
+        with contextlib.suppress(OSError):
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def request_opener(policy: RequestPolicy | None = None) -> urllib.request.OpenerDirector:
+    policy = policy or RequestPolicy()
+    handlers: list[Any] = []
+    if policy.direct:
+        handlers.append(urllib.request.ProxyHandler({}))
+    if policy.cookie_mode == "file" and cookie_file_available():
+        jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
+        try:
+            jar.load(ignore_discard=True, ignore_expires=False)
+            handlers.append(urllib.request.HTTPCookieProcessor(jar))
+        except (OSError, http.cookiejar.LoadError):
+            pass
+    return urllib.request.build_opener(*handlers)
+
+
+def xinpianchang_cookie_params(policy: RequestPolicy) -> list[dict[str, Any]]:
+    """Load only xinpianchang.com cookies for the isolated, task-scoped browser."""
+    if policy.cookie_mode != "file" or not cookie_file_available():
+        return []
+    jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
+    try:
+        jar.load(ignore_discard=True, ignore_expires=False)
+    except (OSError, http.cookiejar.LoadError) as exc:
+        raise DwError("无法读取手动 cookies.txt。", str(exc), cookie_related=True) from exc
+
+    values: list[dict[str, Any]] = []
+    for cookie in jar:
+        domain = str(cookie.domain or "").lower().lstrip(".")
+        if not hostname_matches(domain, {"xinpianchang.com"}):
+            continue
+        rest = cookie._rest or {}
+        item: dict[str, Any] = {
+            "name": str(cookie.name),
+            "value": str(cookie.value),
+            "domain": str(cookie.domain),
+            "path": str(cookie.path or "/"),
+            "secure": bool(cookie.secure),
+            "httpOnly": "HTTPOnly" in rest or "HttpOnly" in rest,
+        }
+        if cookie.expires and cookie.expires > time.time():
+            item["expires"] = float(cookie.expires)
+        values.append(item)
+    return values
+
+
+def stop_xinpianchang_browser(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(OSError):
+        process.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=5)
+    if process.poll() is not None:
+        return
+    try:
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        with contextlib.suppress(OSError):
+            process.kill()
+
+
+def cleanup_xinpianchang_session(path: Path) -> None:
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
+    warn(f"Chrome 临时配置未能删除，请手动删除残留路径：{path}")
+
+
+def run_xinpianchang_chrome_bridge(url: str, policy: RequestPolicy) -> dict[str, Any]:
+    if not IS_WINDOWS:
+        raise DwError("新片场 Chrome 辅助模式目前仅支持 Windows 10/11。")
+    chrome = chrome_executable_path()
+    if chrome is None:
+        raise DwError("未检测到 Google Chrome，无法启动新片场辅助模式。")
+    if not DENO.is_file():
+        raise DwError("未检测到 dw 管理的 Deno，无法启动新片场辅助模式。")
+
+    ensure_runtime_directories()
+    # Chrome 136+ ignores remote-debugging switches for the default profile.
+    # A unique task directory also prevents any access to the user's daily profile.
+    session_dir = Path(tempfile.mkdtemp(prefix="xpc-browser-", dir=TASKS_DIR))
+    profile_dir = session_dir / "chrome-profile"
+    bridge_file = session_dir / "xpc-chrome-bridge.js"
+    bridge_file.write_text(XPC_CHROME_BRIDGE_SOURCE, encoding="utf-8", newline="\n")
+    with contextlib.suppress(OSError):
+        bridge_file.chmod(0o600)
+    port = allocate_loopback_port()
+    chrome_args = [
+        str(chrome),
+        f"--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        f"--remote-allow-origins=http://127.0.0.1:{port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-background-mode",
+        "--new-window",
+        "about:blank",
+    ]
+    if policy.direct:
+        chrome_args.insert(-2, "--no-proxy-server")
+
+    info("\n将启动一个仅供本次任务使用的独立 Chrome 窗口。")
+    info("如果页面出现勾选、验证码或登录，请由你本人在该窗口中完成；dw 会自动继续。")
+    info("该窗口不会读取日常 Chrome 配置，关闭后会自动删除临时配置和其中的 Cookies。")
+    browser_process: subprocess.Popen[Any] | None = None
+    helper_process: subprocess.Popen[Any] | None = None
+    stderr_lines: list[str] = []
+    reader: threading.Thread | None = None
+    try:
+        browser_process = subprocess.Popen(
+            chrome_args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        helper_process = subprocess.Popen(
+            [
+                str(DENO),
+                "run",
+                "--no-config",
+                "--quiet",
+                f"--allow-net=127.0.0.1:{port}",
+                str(bridge_file),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=ytdlp_environment(),
+        )
+        assert helper_process.stdin is not None
+        assert helper_process.stdout is not None
+        assert helper_process.stderr is not None
+        reader = threading.Thread(
+            target=process_stderr,
+            args=(helper_process.stderr, stderr_lines),
+            daemon=True,
+        )
+        reader.start()
+        config = {
+            "port": port,
+            "url": url,
+            "timeoutMs": 5 * 60 * 1000,
+            "cookies": xinpianchang_cookie_params(policy),
+        }
+        helper_process.stdin.write(json.dumps(config, ensure_ascii=False))
+        helper_process.stdin.close()
+        output = helper_process.stdout.read()
+        returncode = helper_process.wait()
+        if reader is not None:
+            reader.join(timeout=2)
+        if returncode != 0:
+            raise DwError("新片场 Chrome 辅助模式未能读取作品页。", "".join(stderr_lines))
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if not lines:
+            raise DwError("新片场 Chrome 辅助模式没有返回媒体参数。")
+        try:
+            result = json.loads(lines[-1])
+        except json.JSONDecodeError as exc:
+            raise DwError("新片场 Chrome 辅助模式返回了无效数据。", str(exc)) from exc
+        if not isinstance(result, dict) or not result.get("vid") or not result.get("appKey"):
+            raise DwError("新片场 Chrome 辅助模式未找到媒体参数。")
+        info("Chrome 页面验证已通过，正在读取新片场媒体版本 …")
+        return result
+    except KeyboardInterrupt as exc:
+        if helper_process is not None and helper_process.poll() is None:
+            with contextlib.suppress(OSError):
+                helper_process.terminate()
+        raise DownloadAborted from exc
+    except OSError as exc:
+        raise DwError("无法启动新片场 Chrome 辅助模式。", str(exc)) from exc
+    finally:
+        if helper_process is not None and helper_process.poll() is None:
+            with contextlib.suppress(OSError):
+                helper_process.terminate()
+        if reader is not None:
+            reader.join(timeout=1)
+        if browser_process is not None:
+            stop_xinpianchang_browser(browser_process)
+        cleanup_xinpianchang_session(session_dir)
+
+
+def xinpianchang_http_url(value: Any) -> str | None:
+    text = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError:
+        return None
+    return text if parsed.scheme.lower() in {"http", "https"} and parsed.hostname else None
+
+
+def xinpianchang_fps(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if "/" in text:
+            numerator, denominator = text.split("/", 1)
+            result = float(numerator) / float(denominator)
+        else:
+            result = float(text)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return result if result > 0 else None
+
+
+def xinpianchang_progressive_formats(items: Any, webpage_url: str) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    formats: list[dict[str, Any]] = []
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        media_url = xinpianchang_http_url(item.get("url"))
+        if not media_url:
+            continue
+        codec_parts = [part.strip() for part in str(item.get("codecName") or "").split("/")]
+        vcodec = codec_parts[0] if codec_parts and codec_parts[0] else "unknown"
+        acodec = codec_parts[1] if len(codec_parts) > 1 and codec_parts[1] else "unknown"
+        bitrate = numeric(item.get("bitrate"))
+        mime = str(item.get("mime") or "").lower()
+        ext = "mp4" if "mp4" in mime else Path(urllib.parse.urlsplit(media_url).path).suffix.lstrip(".")
+        height = int(numeric(item.get("height"))) or None
+        profile = str(item.get("profile") or item.get("quality") or "").strip()
+        label = f"{height}p" if height else str(index)
+        formats.append(
+            {
+                "format_id": f"xpc-progressive-{label}-{index}",
+                "format_note": profile,
+                "url": media_url,
+                "protocol": urllib.parse.urlsplit(media_url).scheme.lower(),
+                "ext": ext or "mp4",
+                "width": int(numeric(item.get("width"))) or None,
+                "height": height,
+                "fps": xinpianchang_fps(item.get("fps")),
+                "vcodec": vcodec,
+                "acodec": acodec,
+                "tbr": bitrate / 1000 if bitrate else None,
+                "filesize": int(numeric(item.get("filesize"))) or None,
+                "http_headers": {"Range": "bytes=0-", "Referer": webpage_url},
+            }
+        )
+    return formats
+
+
+def xinpianchang_manifest_formats(
+    resource: dict[str, Any],
+    webpage_url: str,
+    policy: RequestPolicy,
+) -> list[dict[str, Any]]:
+    formats: list[dict[str, Any]] = []
+    extraction_policy = dataclasses.replace(policy, xpc_info=None, xpc_assist_attempted=True)
+    for kind in ("dash", "hls"):
+        item = resource.get(kind)
+        manifest_url = xinpianchang_http_url(item.get("url")) if isinstance(item, dict) else None
+        if not manifest_url:
+            continue
+        try:
+            manifest_info = extract_single(manifest_url, extraction_policy)
+        except DwError as exc:
+            warn(f"新片场 {kind.upper()} 清单解析失败，继续列出其他真实视频流：{concise_error_reason(exc)}")
+            continue
+        manifest_formats = manifest_info.get("formats")
+        if not isinstance(manifest_formats, list):
+            manifest_formats = [manifest_info]
+        for index, fmt in enumerate(manifest_formats, 1):
+            if not isinstance(fmt, dict) or not xinpianchang_http_url(fmt.get("url")):
+                continue
+            prepared = dict(fmt)
+            prepared["format_id"] = f"xpc-{kind}-{prepared.get('format_id') or index}"
+            note = str(prepared.get("format_note") or "").strip()
+            prepared["format_note"] = f"{kind.upper()} {note}".strip()
+            headers = dict(prepared.get("http_headers") or {})
+            headers.setdefault("Referer", webpage_url)
+            prepared["http_headers"] = headers
+            formats.append(prepared)
+    return formats
+
+
+def xinpianchang_thumbnails(data: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[tuple[str, Any]] = [("cover", data.get("cover"))]
+    resource = data.get("resource") if isinstance(data.get("resource"), dict) else {}
+    for name in ("snapshot", "sprite", "remainSprite"):
+        candidates.append((name, resource.get(name)))
+
+    thumbnails: list[dict[str, Any]] = []
+
+    def collect(label: str, value: Any, width: Any = None, height: Any = None) -> None:
+        if isinstance(value, str):
+            image_url = xinpianchang_http_url(value)
+            if image_url:
+                thumbnails.append(
+                    {
+                        "id": f"{label}-{len(thumbnails) + 1}",
+                        "url": image_url,
+                        "width": int(numeric(width)) or None,
+                        "height": int(numeric(height)) or None,
+                    }
+                )
+            return
+        if isinstance(value, list):
+            for child in value:
+                collect(label, child, width, height)
+            return
+        if not isinstance(value, dict):
+            return
+        item_width = value.get("width") or value.get("subImageWidth") or width
+        item_height = value.get("height") or value.get("subImageHeight") or height
+        if value.get("url"):
+            collect(label, value.get("url"), item_width, item_height)
+        for key in ("images", "originImages"):
+            if key in value:
+                collect(f"{label}-{key}", value.get(key), item_width, item_height)
+
+    for label, value in candidates:
+        collect(label, value)
+    return thumbnails
+
+
+def deduplicate_xinpianchang_formats(formats: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    used_ids: set[str] = set()
+    for fmt in formats:
+        key = (
+            fmt.get("url"),
+            fmt.get("width"),
+            fmt.get("height"),
+            fmt.get("fps"),
+            fmt.get("vcodec"),
+            fmt.get("acodec"),
+            fmt.get("tbr"),
+            fmt.get("filesize") or fmt.get("filesize_approx"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        prepared = dict(fmt)
+        base_id = str(prepared.get("format_id") or f"xpc-{len(result) + 1}")
+        format_id = base_id
+        suffix = 2
+        while format_id in used_ids:
+            format_id = f"{base_id}-{suffix}"
+            suffix += 1
+        prepared["format_id"] = format_id
+        used_ids.add(format_id)
+        result.append(prepared)
+    return result
+
+
+def xinpianchang_api_cookie_header(bridge: dict[str, Any], api_url: str) -> str:
+    parsed = urllib.parse.urlsplit(api_url)
+    api_hostname = (parsed.hostname or "").lower()
+    api_path = parsed.path or "/"
+    cookie_pairs: list[str] = []
+    for cookie in bridge.get("cookies") or []:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        raw_domain = str(cookie.get("domain") or "").lower()
+        domain = raw_domain.lstrip(".")
+        cookie_path = str(cookie.get("path") or "/")
+        domain_applies = api_hostname == domain or (
+            raw_domain.startswith(".") and api_hostname.endswith(f".{domain}")
+        )
+        path_prefix = cookie_path.rstrip("/") + "/"
+        path_applies = api_path == cookie_path or api_path.startswith(path_prefix)
+        expires = numeric(cookie.get("expires"))
+        if (
+            re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name)
+            and "\r" not in value
+            and "\n" not in value
+            and ";" not in value
+            and domain_applies
+            and cookie_path.startswith("/")
+            and path_applies
+            and not (expires > 0 and expires <= time.time())
+        ):
+            cookie_pairs.append(f"{name}={value}")
+    return "; ".join(cookie_pairs)
+
+
+def fetch_xinpianchang_media(
+    webpage_url: str,
+    bridge: dict[str, Any],
+    policy: RequestPolicy,
+) -> dict[str, Any]:
+    vid = str(bridge.get("vid") or "")
+    app_key = str(bridge.get("appKey") or "")
+    api_url = (
+        "https://mod-api.xinpianchang.com/mod/api/v2/media/"
+        + urllib.parse.quote(vid, safe="")
+        + "?"
+        + urllib.parse.urlencode({"appKey": app_key})
+    )
+    browser_user_agent = str(bridge.get("userAgent") or "")
+    if not browser_user_agent or len(browser_user_agent) > 512 or any(
+        character in browser_user_agent for character in "\r\n"
+    ):
+        browser_user_agent = USER_AGENT
+    headers = {
+        "Accept": "application/json",
+        "Referer": webpage_url,
+        "User-Agent": browser_user_agent,
+    }
+    cookie_header = xinpianchang_api_cookie_header(bridge, api_url)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    request_value = urllib.request.Request(
+        api_url,
+        headers=headers,
+    )
+    try:
+        with request_opener(policy).open(request_value, timeout=45) as response:
+            payload = json.load(response)
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+    ) as exc:
+        raise DwError("无法读取新片场媒体接口。", str(exc)) from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise DwError("新片场媒体接口没有返回有效作品数据。")
+    resource = data.get("resource") if isinstance(data.get("resource"), dict) else {}
+    formats = xinpianchang_progressive_formats(resource.get("progressive"), webpage_url)
+    formats.extend(xinpianchang_manifest_formats(resource, webpage_url, policy))
+    formats = deduplicate_xinpianchang_formats(formats)
+    for fmt in formats:
+        format_headers = dict(fmt.get("http_headers") or {})
+        format_headers.setdefault("Referer", webpage_url)
+        format_headers.setdefault("User-Agent", browser_user_agent)
+        fmt["http_headers"] = format_headers
+    if not formats:
+        raise DwError("新片场媒体接口没有返回可下载的真实视频流。")
+
+    match = re.search(r"/(a\d+)", urllib.parse.urlsplit(webpage_url).path, flags=re.IGNORECASE)
+    owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+    thumbnails = xinpianchang_thumbnails(data)
+    cover = xinpianchang_http_url(data.get("cover"))
+    return {
+        "id": match.group(1) if match else vid,
+        "title": str(data.get("title") or bridge.get("title") or vid),
+        "description": data.get("description"),
+        "duration": numeric(data.get("duration")) or None,
+        "categories": data.get("categories"),
+        "tags": data.get("keywords"),
+        "thumbnail": cover,
+        "thumbnails": thumbnails,
+        "uploader": owner.get("username"),
+        "uploader_id": str(owner.get("id")) if owner.get("id") is not None else None,
+        "formats": formats,
+        "webpage_url": webpage_url,
+        "original_url": webpage_url,
+        "extractor": "XinpianchangBrowserAssist",
+        "extractor_key": "XinpianchangBrowserAssist",
+        "http_headers": {"Referer": webpage_url, "User-Agent": browser_user_agent},
+        "_dw_xpc_browser_assisted": True,
+    }
+
+
+def xinpianchang_browser_assist(url: str, policy: RequestPolicy) -> dict[str, Any]:
+    bridge = run_xinpianchang_chrome_bridge(url, policy)
+    return fetch_xinpianchang_media(url, bridge, policy)
+
+
 def looks_cookie_related(text: str) -> bool:
     lowered = text.lower()
     strong_patterns = (
@@ -994,12 +1727,16 @@ def parse_json_output(output: str) -> dict[str, Any]:
 
 
 def extract_url(url: str, flat_playlist: bool, policy: RequestPolicy | None = None) -> dict[str, Any]:
+    if policy is not None and policy.xpc_info is not None and is_xinpianchang_url(url):
+        return dict(policy.xpc_info)
     args = ytdlp_base_args(policy, url)
     args.extend(("--dump-single-json", "--flat-playlist" if flat_playlist else "--no-flat-playlist", url))
     return parse_json_output(run_capture(args))
 
 
 def extract_single(url: str, policy: RequestPolicy | None = None) -> dict[str, Any]:
+    if policy is not None and policy.xpc_info is not None and is_xinpianchang_url(url):
+        return dict(policy.xpc_info)
     args = ytdlp_base_args(policy, url)
     args.extend(("--dump-single-json", "--no-playlist", url))
     return parse_json_output(run_capture(args))
@@ -1877,6 +2614,18 @@ def media_candidates(task_dir: Path) -> list[Path]:
     return sorted(candidates, key=lambda path: path.stat().st_size, reverse=True)
 
 
+def strip_dw_private_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_dw_private_fields(child)
+            for key, child in value.items()
+            if not str(key).startswith("_dw_")
+        }
+    if isinstance(value, list):
+        return [strip_dw_private_fields(child) for child in value]
+    return value
+
+
 def build_download_args(
     url: str,
     selection: ItemSelection,
@@ -1884,6 +2633,7 @@ def build_download_args(
     result_file: Path,
     live: bool,
     policy: RequestPolicy | None = None,
+    info_dict: dict[str, Any] | None = None,
 ) -> list[str]:
     selector_parts = [str(selection.video.get("format_id"))]
     if not selection.use_embedded_audio:
@@ -1954,7 +2704,12 @@ def build_download_args(
         )
     if live:
         args.append("--no-live-from-start")
-    args.append(url)
+    if info_dict is not None and info_dict.get("_dw_xpc_browser_assisted"):
+        info_file = task_dir / "xinpianchang.info.json"
+        write_json_atomic(info_file, strip_dw_private_fields(info_dict))
+        args.extend(("--load-info-json", str(info_file)))
+    else:
+        args.append(url)
     return args
 
 
@@ -1964,9 +2719,10 @@ def download_media(
     task_dir: Path,
     live: bool,
     policy: RequestPolicy | None = None,
+    info_dict: dict[str, Any] | None = None,
 ) -> Path:
     result_file = task_dir / "result-path.txt"
-    args = build_download_args(url, selection, task_dir, result_file, live, policy)
+    args = build_download_args(url, selection, task_dir, result_file, live, policy, info_dict)
 
     result = run_download_process(args, live=live)
     candidates: list[Path] = []
@@ -2093,18 +2849,7 @@ def ensure_final_container(path: Path, selection: ItemSelection) -> Path:
 
 
 def thumbnail_opener(policy: RequestPolicy | None = None) -> urllib.request.OpenerDirector:
-    policy = policy or RequestPolicy()
-    handlers: list[Any] = []
-    if policy.direct:
-        handlers.append(urllib.request.ProxyHandler({}))
-    if policy.cookie_mode == "file" and cookie_file_available():
-        jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
-        try:
-            jar.load(ignore_discard=True, ignore_expires=False)
-            handlers.append(urllib.request.HTTPCookieProcessor(jar))
-        except (OSError, http.cookiejar.LoadError):
-            pass
-    return urllib.request.build_opener(*handlers)
+    return request_opener(policy)
 
 
 def download_thumbnails(
@@ -2234,7 +2979,7 @@ def process_item(
     finalized: list[Path] = []
     try:
         info(f"\n开始处理：{title}")
-        media = download_media(url, selection, task_dir, live, policy)
+        media = download_media(url, selection, task_dir, live, policy, info_dict)
         media = normalize_external_audio(media, selection)
         media = ensure_final_container(media, selection)
         validate_media(media)
@@ -2347,17 +3092,39 @@ def network_retry_recommended(detail: str) -> bool:
 def xinpianchang_verification_failure(url: str, detail: str) -> bool:
     lowered = detail.lower()
     return hostname_matches(url_hostname(url), {"xinpianchang.com"}) and any(
-        marker in lowered for marker in ("http error 403", "403: forbidden")
+        marker in lowered
+        for marker in (
+            "http error 403",
+            "403: forbidden",
+            "http error 406",
+            "406: not acceptable",
+            "security verification",
+            "_jsc_ch_conf",
+        )
     )
 
 
 def next_request_policy(url: str, policy: RequestPolicy, exc: DwError) -> RequestPolicy | None:
     detail = exc.detail or exc.message
     xinpianchang_verification = xinpianchang_verification_failure(url, detail)
-    if xinpianchang_verification:
-        warn("新片场首次访问可能需要先在 Chrome 打开该链接并完成页面勾选/验证。")
+    if xinpianchang_verification and not policy.xpc_assist_attempted:
+        warn("新片场作品页拒绝了普通下载请求，需要真实 Chrome 完成页面验证。")
         if policy.cookie_mode == "file":
-            warn(f"完成验证后，请重新导出并覆盖 {COOKIE_FILE}，再重新执行当前链接。")
+            warn(f"已上传的 {COOKIE_FILE} 会仅导入本次临时 Chrome，不会写入日常浏览器配置。")
+        if IS_WINDOWS:
+            if ask_yes_no("是否启动新片场 Chrome 辅助模式（推荐）", default=False):
+                try:
+                    assisted = xinpianchang_browser_assist(url, policy)
+                except DwError as assist_error:
+                    warn(f"新片场 Chrome 辅助模式失败：{concise_error_reason(assist_error)}")
+                else:
+                    return dataclasses.replace(
+                        policy,
+                        xpc_info=assisted,
+                        xpc_assist_attempted=True,
+                    )
+        else:
+            warn("当前系统暂不支持自动 Chrome 辅助模式；可在 Windows 版 dw 中处理该链接。")
     if policy.direct and network_retry_recommended(detail):
         warn("国内网站直连请求失败。")
         if ask_yes_no("是否使用系统代理重试", default=False):

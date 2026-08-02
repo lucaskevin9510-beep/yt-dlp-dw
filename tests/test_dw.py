@@ -491,13 +491,13 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertEqual(args[args.index("--cookies") + 1], str(dw.COOKIE_FILE))
 
     def test_proxy_retry_requires_confirmation(self) -> None:
-        policy = dw.RequestPolicy(direct=True, cookie_mode="none")
+        policy = dw.RequestPolicy(direct=True, cookie_mode="none", xpc_assist_attempted=True)
         failure = dw.DwError("读取失败", "HTTP Error 403: Forbidden")
         with mock.patch.object(dw, "ask_yes_no", return_value=False) as ask:
             self.assertIsNone(dw.next_request_policy("https://www.xinpianchang.com/a1", policy, failure))
         ask.assert_called_once_with("是否使用系统代理重试", default=False)
 
-    def test_xinpianchang_failure_explains_manual_cookie_refresh(self) -> None:
+    def test_xinpianchang_failure_offers_browser_assist_before_proxy(self) -> None:
         policy = dw.RequestPolicy(direct=True, cookie_mode="file")
         failure = dw.DwError("读取失败", "HTTP Error 403: Forbidden")
         with mock.patch.object(dw, "ask_yes_no", return_value=False) as ask, mock.patch.object(
@@ -507,10 +507,113 @@ class PlatformSupportTests(unittest.TestCase):
                 "https://www.xinpianchang.com/a12303964",
                 policy,
                 failure,
-            )
+        )
         self.assertIsNone(replacement)
-        ask.assert_called_once_with("是否使用系统代理重试", default=False)
-        self.assertTrue(any("重新导出" in call.args[0] for call in warning.call_args_list))
+        self.assertEqual(
+            ask.call_args_list,
+            [
+                mock.call("是否启动新片场 Chrome 辅助模式（推荐）", default=False),
+                mock.call("是否使用系统代理重试", default=False),
+            ],
+        )
+        self.assertTrue(any("仅导入本次临时 Chrome" in call.args[0] for call in warning.call_args_list))
+
+    def test_xinpianchang_browser_assist_returns_task_scoped_info(self) -> None:
+        policy = dw.RequestPolicy(direct=True, cookie_mode="file")
+        failure = dw.DwError("读取失败", "HTTP Error 406: Not Acceptable")
+        assisted = {"id": "a123", "formats": [{"format_id": "xpc-1"}]}
+        with mock.patch.object(dw, "IS_WINDOWS", True), mock.patch.object(
+            dw, "ask_yes_no", return_value=True
+        ) as ask, mock.patch.object(
+            dw, "xinpianchang_browser_assist", return_value=assisted
+        ) as bridge:
+            replacement = dw.next_request_policy(
+                "https://www.xinpianchang.com/a123",
+                policy,
+                failure,
+            )
+        self.assertIsNotNone(replacement)
+        assert replacement is not None
+        self.assertTrue(replacement.xpc_assist_attempted)
+        self.assertEqual(replacement.xpc_info, assisted)
+        ask.assert_called_once_with("是否启动新片场 Chrome 辅助模式（推荐）", default=False)
+        bridge.assert_called_once_with("https://www.xinpianchang.com/a123", policy)
+
+    def test_xinpianchang_progressive_metadata_is_preserved(self) -> None:
+        formats = dw.xinpianchang_progressive_formats(
+            [
+                {
+                    "profile": "高清 1080p",
+                    "mime": "video/mp4",
+                    "bitrate": 4_012_010,
+                    "fps": "25/1",
+                    "codecName": "h264 / aac",
+                    "filesize": 108_249_570,
+                    "width": 1920,
+                    "height": 816,
+                    "url": "https://cdn.example/video.mp4",
+                },
+                {"profile": "不可下载", "width": 3840, "height": 1634, "url": None},
+            ],
+            "https://www.xinpianchang.com/a123",
+        )
+        self.assertEqual(len(formats), 1)
+        self.assertEqual(formats[0]["vcodec"], "h264")
+        self.assertEqual(formats[0]["acodec"], "aac")
+        self.assertEqual(formats[0]["fps"], 25)
+        self.assertAlmostEqual(formats[0]["tbr"], 4012.01)
+        self.assertEqual(formats[0]["http_headers"]["Range"], "bytes=0-")
+
+    def test_xinpianchang_temporary_cookies_keep_domain_and_path_scope(self) -> None:
+        bridge = {
+            "cookies": [
+                {"name": "auth", "value": "good", "domain": ".xinpianchang.com", "path": "/"},
+                {"name": "www", "value": "wrong-host", "domain": ".www.xinpianchang.com", "path": "/"},
+                {"name": "hostonly", "value": "wrong-host", "domain": "xinpianchang.com", "path": "/"},
+                {"name": "path", "value": "wrong-path", "domain": ".xinpianchang.com", "path": "/account"},
+                {"name": "expired", "value": "old", "domain": ".xinpianchang.com", "path": "/", "expires": 1},
+                {"name": "bad", "value": "line\r\nbreak", "domain": ".xinpianchang.com", "path": "/"},
+            ]
+        }
+        header = dw.xinpianchang_api_cookie_header(
+            bridge,
+            "https://mod-api.xinpianchang.com/mod/api/v2/media/vid?appKey=key",
+        )
+        self.assertEqual(header, "auth=good")
+
+    def test_xinpianchang_download_uses_task_info_json(self) -> None:
+        selected_video = video("xpc-1080", "mp4", 1080, acodec="aac")
+        selection = dw.ItemSelection(
+            video=selected_video,
+            audios=[],
+            use_embedded_audio=True,
+            replace_embedded_audio=False,
+            container_mode="mp4",
+            resolved_container="mp4",
+            thumbnails=[],
+        )
+        assisted = {
+            "id": "a123",
+            "title": "测试",
+            "formats": [selected_video],
+            "_dw_xpc_browser_assisted": True,
+        }
+        with writable_test_directory() as temp:
+            task_dir = Path(temp)
+            args = dw.build_download_args(
+                "https://www.xinpianchang.com/a123",
+                selection,
+                task_dir,
+                task_dir / "result.txt",
+                False,
+                dw.RequestPolicy(direct=True, cookie_mode="file", xpc_info=assisted),
+                assisted,
+            )
+            info_path = Path(args[args.index("--load-info-json") + 1])
+            payload = dw.read_json(info_path, {})
+        self.assertNotIn("https://www.xinpianchang.com/a123", args)
+        self.assertNotIn("_dw_xpc_browser_assisted", payload)
+        self.assertEqual(payload["formats"][0]["format_id"], "xpc-1080")
 
     def test_cookie_failure_does_not_retry_with_unreliable_browser_database(self) -> None:
         policy = dw.RequestPolicy(direct=True, cookie_mode="file")

@@ -15,7 +15,7 @@
 | 文件容器 | 每次选择自动、MP4、MKV 或 WebM；不转码，不兼容时要求重新选择并推荐 MKV |
 | 播放列表 | 分页显示项目，支持单选、多选、范围和全部；第一项的规则可自动应用到后续项目 |
 | 图片 | 列出并去重所有可下载缩略图，支持多选或全部下载，最终统一保存为 PNG |
-| Cookies | 每次任务可选“手动 `cookies.txt`”或“不使用”；直接回车默认使用固定位置的手动文件 |
+| Cookies | 每次任务可选“手动 `cookies.txt`”或“不使用”；直接回车默认使用固定位置的手动文件；Windows 新片场验证失败时可征得同意后启动隔离 Chrome 辅助模式 |
 | 标签与水印源 | 最终无损重封装会删除容器元数据/平台标签；存在干净流时自动排除 yt-dlp 明确标记的带水印流 |
 | 网络策略 | 国内网站优先强制直连；直连失败后才询问是否使用系统代理，不静默切换 |
 | 下载速度 | 普通 HTTP/HTTPS 文件使用 aria2c 进行 8 连接分片；HLS/DASH 使用 yt-dlp 原生 8 片段并发 |
@@ -164,7 +164,7 @@ Cookies 使用方式：
 - 直接按回车或选 `1`：使用 Windows `%USERPROFILE%\cookies.txt` 或 Debian `/root/cookies.txt`；文件不存在时会要求先上传；
 - 选 `2`：本次任务完全不使用 Cookies。
 
-Windows 上 yt-dlp 的 Chrome 数据库复制功能存在长期未解决的权限/锁定问题；即使关闭浏览器也可能出现 `Could not copy Chrome cookie database`。为避免把不可靠选项继续推荐给用户，交互菜单已移除智能读取 Chrome，统一使用可检查、可替换的 Netscape `cookies.txt`。
+Windows 上 yt-dlp 的 Chrome 数据库复制功能存在长期未解决的权限/锁定问题；即使关闭浏览器也可能出现 `Could not copy Chrome cookie database`。因此普通 Cookies 菜单不直接读取日常 Chrome 数据库，统一使用可检查、可替换的 Netscape `cookies.txt`。新片场遇到浏览器验证页时有单独的、需再次征得同意的隔离 Chrome 辅助流程，详见下方说明。
 
 选择完成后才会读取链接。普通单视频直接进入格式选择；播放列表先选项目；直播先询问是否录制。
 
@@ -490,7 +490,16 @@ chmod 600 /root/cookies.txt
 
 手动文件存在时会显示“已发现并启用 cookies”；不存在时会显示“未检测到 cookies”并要求重新选择。错误明确指向登录会话或 Cookies 时，程序会建议重新导出并更新手动文件；无法确定时保留 yt-dlp 的实际失败原因，不会武断归因。
 
-新片场首次访问如果出现页面勾选/验证，请先在 Chrome 中打开原链接并完成验证，然后重新导出 `cookies.txt`。若 `dw` 仍收到 403，会保留实际错误，并在直连失败后询问是否使用系统代理重试。
+Windows 版处理新片场时，如果普通 yt-dlp 请求收到 `403 Forbidden` 或 `406 Not Acceptable`，会询问 `是否启动新片场 Chrome 辅助模式（推荐）`。输入 `y` 后：
+
+1. `dw` 启动一个只供当前任务使用的独立 Chrome 配置目录，不读取或修改日常 Chrome 配置；
+2. 如果已选择手动 `cookies.txt`，只把其中属于 `xinpianchang.com` 的 Cookie 通过本机回环接口导入该临时 Chrome；
+3. 页面若出现勾选、验证码或登录，由用户本人在打开的窗口中完成；无需在 PowerShell 敲回车，程序会自动检测；
+4. 页面通过后读取作品的 `vid/appKey`；临时会话中新产生且仅属于新片场的 Cookie 只由本次任务使用，`dw` 不另行导出或覆盖手动 `cookies.txt`；
+5. `dw` 直接请求新片场官方媒体接口，并照常列出全部真实可下载版本；
+6. Chrome 窗口、临时配置和其中的 Cookie 随即删除。清理失败时会明确列出残留路径。
+
+辅助 Chrome 同样遵循国内站点直连策略。辅助失败后仍会保留真实原因，并询问是否使用系统代理重试。该自动辅助目前仅用于 Windows 10/11 的新片场链接；Debian 版仍使用手动 `cookies.txt` 和 yt-dlp 原生提取流程。
 
 `cookies.txt` 含有敏感登录凭据，不要上传到本仓库或发送给他人。
 
@@ -673,9 +682,9 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 
 直接粘贴全部文案，不需要手动删除前后文字。`dw` 会保留 `v.douyin.com` 短链接，并将 `https://www.douyin.com/jingxuan?modal_id=<数字>` 转换为 yt-dlp 可识别的 `/video/<数字>` 链接。抖音如提示 `Fresh cookies needed`，请在 Chrome 中登录后重新导出 `%USERPROFILE%\cookies.txt`。
 
-### 新片场链接返回 403 怎么办？
+### 新片场链接返回 403 或 406 怎么办？
 
-先用 Chrome 打开同一链接，完成首次访问的页面勾选/验证并确认页面能播放，然后重新导出固定位置的 `cookies.txt`。再次运行链接后若直连仍失败，程序才会询问是否改用系统代理。
+Windows 版会先询问是否启动新片场 Chrome 辅助模式。输入 `y`，在弹出的独立 Chrome 窗口中完成页面勾选、验证码或登录；完成后不要关闭窗口，也不用敲回车，`dw` 会自动读取媒体版本并关闭窗口。该流程不复制日常 Chrome Cookie 数据库，临时配置会在任务后删除。若辅助直连失败，程序会显示原因，再询问是否使用系统代理。
 
 ### 为什么下载后仍能看到 Bilibili、小红书或上传者水印？
 

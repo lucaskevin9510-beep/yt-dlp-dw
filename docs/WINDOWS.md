@@ -8,6 +8,7 @@
 - x64/amd64 处理器，不支持 x86、ARM64；
 - Windows PowerShell 5.1 或更高版本；
 - 能访问至少一个 GitHub 官方/回退源、Python.org 和目标视频网站；
+- 新片场的浏览器辅助回退需要已安装 Google Chrome；其他网站不依赖 Chrome；
 - 不需要管理员权限，也不需要预先安装 Python、yt-dlp、Deno、FFmpeg 或 aria2c。
 
 程序按当前 Windows 用户独立安装，不会安装系统级 Python，也不会调用 Winget、Chocolatey 或修改机器级 PATH；只管理当前用户 PATH 和自己的命令别名。
@@ -115,7 +116,7 @@ Cookies 使用方式：
 - 直接按回车或选 `1`：读取 `%USERPROFILE%\cookies.txt`，文件不存在时要求先上传；
 - 选 `2`：本次任务不使用 Cookies。
 
-yt-dlp 在 Windows 上读取 Chrome Cookie 数据库可能长期报 `Could not copy Chrome cookie database`，并非关闭浏览器就一定能解决。因此 `dw` 不再显示这个不可靠选项，统一使用用户主动导出的 Netscape `cookies.txt`。
+yt-dlp 在 Windows 上读取 Chrome Cookie 数据库可能长期报 `Could not copy Chrome cookie database`，并非关闭浏览器就一定能解决。因此普通 Cookies 菜单不读取日常 Chrome 数据库，统一使用用户主动导出的 Netscape `cookies.txt`。新片场遇到浏览器验证页时另有隔离 Chrome 辅助模式，不属于 `--cookies-from-browser`，并且每次都会先征得同意。
 
 ### 4. 选择视频
 
@@ -229,7 +230,25 @@ dw
 
 只有看到“已发现并启用 cookies”才表示手动文件已使用。Cookies 等同登录凭据，请勿上传到 GitHub、网盘或发送给其他人。
 
-新片场首次访问如果需要页面勾选/验证，先在 Chrome 打开原链接并完成操作，然后重新导出并覆盖上述 `cookies.txt`。若直连仍失败，`dw` 会显示实际原因，再询问是否使用系统代理。
+### 新片场隔离 Chrome 辅助模式
+
+新片场作品页可能由 JavaScript 安全验证拦截，表现为 yt-dlp 返回 `403 Forbidden` 或 `406 Not Acceptable`，即使刚导出的 `cookies.txt` 也可能因为请求指纹不同而失败。此时 `dw` 会询问：
+
+```text
+是否启动新片场 Chrome 辅助模式（推荐） [y/N]：
+```
+
+输入 `y` 后，程序会：
+
+1. 启动一个可见的、只供当前任务使用的独立 Chrome 窗口；
+2. 如果本次选择了手动 Cookies，仅把 `cookies.txt` 中属于新片场的项目导入临时会话；
+3. 等待真实 Chrome 执行页面验证。出现勾选、验证码或登录时，必须由用户本人在该窗口完成；
+4. 自动检测作品页已经可用，无需在 PowerShell 不断敲回车；
+5. 读取作品的公开媒体参数；临时会话中新产生且仅属于新片场的 Cookie 只由本次任务使用，`dw` 不另行导出或覆盖手动 `cookies.txt`；
+6. 由 `dw` 直接调用新片场官方媒体接口、列出版本并下载；
+7. 关闭辅助窗口并删除临时 Chrome 配置。若删除失败，会明确显示残留路径。
+
+该模式不会打开、复制或修改日常 Chrome 配置及其 Cookie 数据库。任务期间，隔离 Chrome 的临时配置目录可能包含本次新片场 Cookie；正常完成、失败或取消后都会删除，不会长期保留。辅助 Chrome 默认强制直连；失败后 `dw` 才会询问是否使用系统代理重试。
 
 ## 平台标签与水印
 
@@ -369,9 +388,9 @@ dw
 
 可直接粘贴 `https://www.douyin.com/jingxuan?modal_id=...` 或带 `v.douyin.com` 短链接的整段分享口令。`dw` 会自动提取 URL，并将数字 `modal_id` 转换为 `/video/<id>`。若提示 `Fresh cookies needed`，请在 Chrome 登录后重新导出 `%USERPROFILE%\cookies.txt`。
 
-### 新片场返回 403
+### 新片场返回 403 或 406
 
-先在 Chrome 打开同一新片场链接，完成首次页面勾选/验证并确认能播放，然后重新导出 `%USERPROFILE%\cookies.txt`。再次运行后如果直连仍失败，程序会询问是否使用系统代理。
+选择手动 `%USERPROFILE%\cookies.txt` 后重新运行链接。出现提示时输入 `y` 启动隔离 Chrome，在弹出的窗口中由你本人完成勾选、验证码或登录。页面通过后无需关闭窗口，也无需在 PowerShell 敲回车，程序会自动继续并清理临时会话。若辅助直连仍失败，程序会显示真实原因，再询问是否使用系统代理。
 
 ### 下载后仍能看到 Bilibili 或小红书水印
 
