@@ -56,7 +56,7 @@ jobs:
         shell: powershell
         run: |
           $allErrors = @()
-          foreach ($path in @('install-windows.ps1', 'windows/uninstall-cleanup.ps1')) {
+          foreach ($path in @('install-windows.ps1', 'windows/uninstall-cleanup.ps1', 'windows/update-runner.ps1')) {
             $tokens = $null
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile(

@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$Repository = "lucaskevin9510-beep/yt-dlp-dw",
-    [string]$RepositoryRef = $env:DW_REPO_REF
+    [string]$RepositoryRef = $env:DW_REPO_REF,
+    [string]$UpdateRef = $env:DW_UPDATE_REF
 )
 
 Set-StrictMode -Version 2.0
@@ -10,6 +11,21 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($RepositoryRef)) {
     $RepositoryRef = "main"
+}
+if ([string]::IsNullOrWhiteSpace($UpdateRef)) {
+    $UpdateRef = $RepositoryRef
+}
+if ($Repository -notmatch "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") {
+    throw "Install failed: invalid repository name."
+}
+foreach ($RefValue in @($RepositoryRef, $UpdateRef)) {
+    if (
+        $RefValue -notmatch "^[A-Za-z0-9._/-]+$" -or
+        $RefValue.StartsWith("/") -or $RefValue.StartsWith("-") -or
+        $RefValue.EndsWith("/") -or $RefValue.Contains("..") -or $RefValue.Contains("//")
+    ) {
+        throw "Install failed: invalid repository reference."
+    }
 }
 
 $PythonVersion = "3.13.14"
@@ -30,12 +46,14 @@ $RuntimeDir = Join-Path $AppDir "python"
 $PythonExe = Join-Path $RuntimeDir "python.exe"
 $DwScript = Join-Path $AppDir "dw.py"
 $CleanupScript = Join-Path $AppDir "uninstall-windows.ps1"
+$UpdateScript = Join-Path $AppDir "update-windows.ps1"
 $Launcher = Join-Path $CommandDir "dw.cmd"
 $AliasDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
 $AliasLauncher = Join-Path $AliasDir "dw.cmd"
 $AppMarker = Join-Path $AppDir ".dw-owned"
 $StateMarker = Join-Path $StateDir ".dw-owned"
 $MirrorFile = Join-Path $StateDir "github-mirrors.txt"
+$UpdateConfig = Join-Path $StateDir "update-source.json"
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("dw-install-" + [Guid]::NewGuid().ToString("N"))
 $CustomMirrorFailureText = [Text.Encoding]::UTF8.GetString(
     [Convert]::FromBase64String("5L2g5o+Q5L6b55qE6ZWc5YOP5Z+f5ZCN5LiN5Y+v5L2/55So")
@@ -167,7 +185,7 @@ function Save-HttpFileWithProgress([string]$Uri, [string]$Destination) {
     try {
         $Request = [Net.HttpWebRequest][Net.WebRequest]::Create($Uri)
         $Request.AllowAutoRedirect = $true
-        $Request.UserAgent = "yt-dlp-dw-installer/1.2.1"
+        $Request.UserAgent = "yt-dlp-dw-installer/1.3.0"
         $Request.Timeout = 90000
         $Request.ReadWriteTimeout = 90000
         $Response = [Net.HttpWebResponse]$Request.GetResponse()
@@ -402,7 +420,12 @@ function Install-PortablePython {
     Write-Host "Installed verified portable Python $PythonVersion."
 }
 
-function Resolve-InstallerSource([string]$RelativePath, [string]$RemotePath, [string]$TemporaryName) {
+function Resolve-InstallerSource(
+    [string]$RelativePath,
+    [string]$RemotePath,
+    [string]$TemporaryName,
+    [string]$Identity
+) {
     if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
         $LocalPath = Join-Path $PSScriptRoot $RelativePath
         if (Test-Path -LiteralPath $LocalPath -PathType Leaf) {
@@ -410,7 +433,6 @@ function Resolve-InstallerSource([string]$RelativePath, [string]$RemotePath, [st
         }
     }
     $Destination = Join-Path $TempDir $TemporaryName
-    $Identity = if ($RemotePath -eq "src/dw.py") { "yt-dlp-dw" } else { "dw-managed-windows-cleanup" }
     Get-RemoteFile "$RawBase/$RemotePath" $Destination $RemotePath $Identity
     return $Destination
 }
@@ -433,16 +455,29 @@ try {
 
     Install-PortablePython
 
-    $SourceScript = Resolve-InstallerSource "src\dw.py" "src/dw.py" "dw.py"
-    $SourceCleanup = Resolve-InstallerSource "windows\uninstall-cleanup.ps1" "windows/uninstall-cleanup.ps1" "uninstall-cleanup.ps1"
+    $SourceScript = Resolve-InstallerSource "src\dw.py" "src/dw.py" "dw.py" "yt-dlp-dw"
+    $SourceCleanup = Resolve-InstallerSource "windows\uninstall-cleanup.ps1" "windows/uninstall-cleanup.ps1" "uninstall-cleanup.ps1" "dw-managed-windows-cleanup"
+    $SourceUpdate = Resolve-InstallerSource "windows\update-runner.ps1" "windows/update-runner.ps1" "update-runner.ps1" "dw-managed-windows-update"
     if (-not (Select-String -LiteralPath $SourceScript -SimpleMatch "yt-dlp-dw" -Quiet)) {
         Fail "downloaded dw.py failed its identity check."
     }
     if (-not (Select-String -LiteralPath $SourceCleanup -SimpleMatch "dw-managed-windows-cleanup" -Quiet)) {
         Fail "downloaded cleanup helper failed its identity check."
     }
+    if (-not (Select-String -LiteralPath $SourceUpdate -SimpleMatch "dw-managed-windows-update" -Quiet)) {
+        Fail "downloaded update helper failed its identity check."
+    }
     Install-AtomicFile $SourceScript $DwScript
     Install-AtomicFile $SourceCleanup $CleanupScript
+    Install-AtomicFile $SourceUpdate $UpdateScript
+
+    $UpdateConfigSource = Join-Path $TempDir "update-source.json"
+    $UpdateConfigText = [ordered]@{
+        repository = $Repository
+        ref = $UpdateRef
+    } | ConvertTo-Json
+    [IO.File]::WriteAllText($UpdateConfigSource, $UpdateConfigText + "`n", [Text.UTF8Encoding]::new($false))
+    Install-AtomicFile $UpdateConfigSource $UpdateConfig
 
     if ($WorkingCustomMirrors.Count -gt 0) {
         [IO.File]::WriteAllLines($MirrorFile, @($WorkingCustomMirrors), [Text.UTF8Encoding]::new($false))
@@ -478,7 +513,7 @@ set "PYTHONIOENCODING=utf-8"
 
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
-    Write-Host "Installing and verifying yt-dlp, Deno, FFmpeg, and FFprobe ..."
+    Write-Host "Installing and verifying yt-dlp, Deno, FFmpeg, FFprobe, and aria2c ..."
     & $PythonExe $DwScript --install-dependencies --force
     if ($LASTEXITCODE -ne 0) {
         Fail "dependency installation returned exit code $LASTEXITCODE."

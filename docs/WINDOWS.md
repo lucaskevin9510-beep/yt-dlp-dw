@@ -8,7 +8,7 @@
 - x64/amd64 处理器，不支持 x86、ARM64；
 - Windows PowerShell 5.1 或更高版本；
 - 能访问至少一个 GitHub 官方/回退源、Python.org 和目标视频网站；
-- 不需要管理员权限，也不需要预先安装 Python、yt-dlp、Deno 或 FFmpeg。
+- 不需要管理员权限，也不需要预先安装 Python、yt-dlp、Deno、FFmpeg 或 aria2c。
 
 程序按当前 Windows 用户独立安装，不会安装系统级 Python，也不会调用 Winget、Chocolatey 或修改机器级 PATH；只管理当前用户 PATH 和自己的命令别名。
 
@@ -45,7 +45,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestM
 
 1. 验证 Windows 版本和 CPU 架构；
 2. 下载并校验 Python 3.13 x64 官方嵌入式运行时；
-3. 安装 Windows x64 版 yt-dlp nightly、Deno、FFmpeg 和 FFprobe；
+3. 安装 Windows x64 版 yt-dlp nightly、Deno、FFmpeg、FFprobe 和经过固定 SHA-256 校验的 aria2c；
 4. 使用上游提供的 SHA-256 校验文件验证所有媒体依赖；
 5. 创建 `dw.cmd`，把专用命令目录加入当前用户 PATH；
 6. 在已有的 `%LOCALAPPDATA%\Microsoft\WindowsApps` 中创建受管理的即时别名，让当前窗口及 Windows Terminal 新标签页直接识别 `dw`。
@@ -90,6 +90,7 @@ dw
 ========== dw 下载助手 ==========
 1. 开始下载
 2. 卸载 dw
+3. 更新 dw
 0. 退出
 请选择：1
 ```
@@ -176,6 +177,12 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 ```
 
 最后输入 `y` 可以继续下一个链接，按回车或输入 `n` 返回主菜单。
+
+## 下载速度与“按回车才继续”
+
+普通 HTTP/HTTPS 媒体文件默认由 aria2c 使用 8 个连接分片下载；HLS/DASH 分段流使用 yt-dlp 原生的 8 片段并发。直播保持原生下载，避免外部下载器干扰连续录制。8 路指网络连接/片段并发，并不保证跑满千兆带宽；网站限速、CDN、HTTP Range 支持、磁盘和本地线路都会影响结果。
+
+程序启动时会关闭经典 Windows 控制台的“快速编辑”暂停，并让 yt-dlp/aria2c 的标准输入保持关闭，因此下载不应再依靠反复敲回车推进；`Ctrl+C` 取消仍可正常使用。如果当前窗口已经处于文字选择状态，先按 `Esc` 退出选择，再更新并重新启动 `dw`。
 
 ## 输入语法
 
@@ -278,7 +285,13 @@ $env:DW_GITHUB_MIRRORS = 'https://mirror.example/{url};https://backup.example/'
 
 ## 更新
 
-每次下载前，程序每 24 小时最多检查一次 yt-dlp nightly、Deno 和 FFmpeg。GitHub 查询和 Release 下载会使用自定义镜像、官方源与内置回退源。更新主程序或便携 Python 时，重新运行一键安装命令即可；下载清单和状态会保留。
+每次下载前，程序每 24 小时最多检查一次 yt-dlp nightly、Deno、FFmpeg 和 aria2c。需要更新 `dw` 主程序时，运行 `dw` 并在主菜单选择：
+
+```text
+3. 更新 dw
+```
+
+程序会显示安装器下载进度，当前 `dw` 退出后自动完成安装；更新结束后重新输入 `dw`。无需再次粘贴一键安装命令，下载清单、状态、成品和 `%USERPROFILE%\cookies.txt` 都会保留。只有从缺少菜单更新组件的旧版本第一次升级时，才需要重新运行一次本文开头的一键安装命令。
 
 ## 安全卸载
 
@@ -306,17 +319,27 @@ dw
 |---|---|
 | `%LOCALAPPDATA%\yt-dlp-dw\dw.py` | 主程序 |
 | `%LOCALAPPDATA%\yt-dlp-dw\python\` | 官方嵌入式 Python |
-| `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe |
+| `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe、aria2c |
+| `%LOCALAPPDATA%\yt-dlp-dw\update-windows.ps1` | 菜单更新使用的受管理更新器 |
 | `%LOCALAPPDATA%\yt-dlp-dw\command\dw.cmd` | `dw` 命令入口 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps\dw.cmd` | 立即生效的受管理别名，卸载时删除 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\cache\` | 专用缓存 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\tasks\` | 下载事务临时目录 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\downloads.json` | 安全卸载清单 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\github-mirrors.txt` | 用户可选的持久 GitHub 镜像列表 |
+| `%LOCALAPPDATA%\yt-dlp-dw-data\update-source.json` | 菜单更新使用的仓库和版本标识 |
 | `%USERPROFILE%\Downloads\` | 默认成品位置，可能被 Windows 重定向 |
 | `%USERPROFILE%\cookies.txt` | 用户可选 Cookies，不属于程序生成文件 |
 
 ## 常见问题
+
+### 下载会停住，必须反复按回车
+
+先按 `Esc` 检查是否退出了控制台文字选择状态，再通过主菜单 `3` 更新到新版。新版会关闭经典控制台的快速编辑暂停，并禁止下载子进程等待终端输入。如果仍复现，请保留卡住前最后 20 行输出，并说明使用的是 Windows PowerShell、CMD 还是 Windows Terminal。
+
+### 已启用 8 路为什么仍然只有几 MiB/s
+
+8 路只能加速允许并发分片或 HTTP Range 的资源，不能绕过网站针对 IP、账号、视频或 CDN 节点的限速。直播也不会交给 aria2c。请以终端中 yt-dlp/aria2c 的实时速度为准，并用不同网站的资源交叉测试。
 
 ### PowerShell 显示脚本执行被禁止
 

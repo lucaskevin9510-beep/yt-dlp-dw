@@ -49,14 +49,45 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
     msvcrt = None
 
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 IS_WINDOWS = os.name == "nt"
+
+
+def disable_windows_quick_edit() -> None:
+    """Prevent classic conhost text selection from pausing active downloads."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+        input_handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        invalid_handle = ctypes.c_void_p(-1).value
+        mode = wintypes.DWORD()
+        if input_handle in (None, invalid_handle) or not kernel32.GetConsoleMode(
+            input_handle, ctypes.byref(mode)
+        ):
+            return
+        enable_extended_flags = 0x0080
+        enable_quick_edit_mode = 0x0040
+        updated = (mode.value | enable_extended_flags) & ~enable_quick_edit_mode
+        kernel32.SetConsoleMode(input_handle, updated)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
 
 
 def configure_console() -> None:
     """Use UTF-8 for interactive output, including when imported on Windows."""
     if not IS_WINDOWS:
         return
+    disable_windows_quick_edit()
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
@@ -117,6 +148,7 @@ YT_DLP = BIN_DIR / f"yt-dlp{_EXECUTABLE_SUFFIX}"
 DENO = BIN_DIR / f"deno{_EXECUTABLE_SUFFIX}"
 FFMPEG = BIN_DIR / f"ffmpeg{_EXECUTABLE_SUFFIX}"
 FFPROBE = BIN_DIR / f"ffprobe{_EXECUTABLE_SUFFIX}"
+ARIA2 = BIN_DIR / "aria2c.exe" if IS_WINDOWS else Path("/usr/bin/aria2c")
 CACHE_DIR = STATE_DIR / "cache"
 TASKS_DIR = STATE_DIR / "tasks"
 COMPONENTS_FILE = STATE_DIR / "components.json"
@@ -127,11 +159,19 @@ LOCK_FILE = STATE_DIR / "dw.lock"
 APP_MARKER = APP_DIR / ".dw-owned"
 STATE_MARKER = STATE_DIR / ".dw-owned"
 WINDOWS_UNINSTALL_HELPER = APP_DIR / "uninstall-windows.ps1"
+WINDOWS_UPDATE_HELPER = APP_DIR / "update-windows.ps1"
+UPDATE_CONFIG_FILE = STATE_DIR / "update-source.json"
+UPDATE_DIR = STATE_DIR / "update"
 
 GITHUB_API = "https://api.github.com/repos"
+DEFAULT_UPDATE_REPOSITORY = "lucaskevin9510-beep/yt-dlp-dw"
 USER_AGENT = f"yt-dlp-dw/{APP_VERSION} (+https://github.com/lucaskevin9510-beep/yt-dlp-dw)"
 PAGE_SIZE = 30
 UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
+DOWNLOAD_CONNECTIONS = 8
+ARIA2_VERSION = "1.37.0"
+ARIA2_WINDOWS_ASSET = f"aria2-{ARIA2_VERSION}-win-64bit-build1.zip"
+ARIA2_WINDOWS_SHA256 = "67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288"
 UNINSTALL_CONFIRMATION = "确认卸载并删除全部下载"
 
 BUILTIN_GITHUB_MIRRORS = (
@@ -774,10 +814,42 @@ def install_ffmpeg(metadata: dict[str, Any], workdir: Path, force: bool) -> None
     info("  FFmpeg/FFprobe 已更新")
 
 
+def install_aria2(metadata: dict[str, Any], workdir: Path, force: bool) -> None:
+    if not IS_WINDOWS:
+        if not ARIA2.is_file() or not os.access(ARIA2, os.X_OK):
+            raise DwError("未检测到 aria2c，请重新运行 Debian 安装器。")
+        return
+    if not force and metadata.get("aria2") == ARIA2_VERSION and ARIA2.is_file():
+        return
+    url = (
+        f"https://github.com/aria2/aria2/releases/download/release-{ARIA2_VERSION}/"
+        f"{ARIA2_WINDOWS_ASSET}"
+    )
+    archive = workdir / ARIA2_WINDOWS_ASSET
+    info(f"  下载 {ARIA2_WINDOWS_ASSET} …")
+    download_file(url, archive)
+    if sha256_file(archive) != ARIA2_WINDOWS_SHA256:
+        raise DwError("aria2 Windows x64 压缩包的 SHA-256 校验失败，已拒绝安装。")
+    extracted = workdir / "aria2c-extracted.exe"
+    with zipfile.ZipFile(archive) as bundle:
+        matches = [
+            member
+            for member in bundle.infolist()
+            if not member.is_dir() and Path(member.filename).name.lower() == "aria2c.exe"
+        ]
+        if len(matches) != 1:
+            raise DwError("aria2 压缩包结构异常，找不到唯一的 aria2c.exe。")
+        with bundle.open(matches[0]) as source, extracted.open("wb") as target:
+            shutil.copyfileobj(source, target)
+    atomic_install_binary(extracted, ARIA2)
+    metadata["aria2"] = ARIA2_VERSION
+    info(f"  aria2c 已安装至 {ARIA2_VERSION}")
+
+
 def dependencies_present() -> bool:
     return all(
         path.is_file() and (IS_WINDOWS or os.access(path, os.X_OK))
-        for path in (YT_DLP, DENO, FFMPEG, FFPROBE)
+        for path in (YT_DLP, DENO, FFMPEG, FFPROBE, ARIA2)
     )
 
 
@@ -790,21 +862,26 @@ def install_or_update_dependencies(force: bool = False) -> None:
         info("依赖在最近 24 小时内已检查，跳过更新。")
         return
 
-    info("正在检查 yt-dlp、Deno 和 FFmpeg …")
+    info("正在检查 yt-dlp、Deno、FFmpeg 和 aria2 …")
     failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="dependency-", dir=STATE_DIR) as temp_name:
         workdir = Path(temp_name)
-        for label, installer in (
+        installers = [
             ("yt-dlp", install_ytdlp),
             ("Deno", install_deno),
             ("FFmpeg", install_ffmpeg),
-        ):
+        ]
+        if IS_WINDOWS:
+            installers.append(("aria2", install_aria2))
+        else:
+            install_aria2(metadata, workdir / "aria2", force)
+        for label, installer in installers:
             component_dir = workdir / label.lower()
             component_dir.mkdir()
             try:
                 installer(metadata, component_dir, force)
             except DwError as exc:
-                if {"yt-dlp": YT_DLP, "Deno": DENO, "FFmpeg": FFMPEG}[label].exists():
+                if {"yt-dlp": YT_DLP, "Deno": DENO, "FFmpeg": FFMPEG, "aria2": ARIA2}[label].exists():
                     failures.append(f"{label} 更新失败，继续使用现有版本：{exc.message}")
                 else:
                     raise
@@ -822,6 +899,7 @@ def install_or_update_dependencies(force: bool = False) -> None:
 def ytdlp_environment() -> dict[str, str]:
     env = os.environ.copy()
     env["DENO_DIR"] = str(CACHE_DIR / "deno")
+    env["PATH"] = str(BIN_DIR) + os.pathsep + env.get("PATH", "")
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     if not IS_WINDOWS:
@@ -1726,6 +1804,7 @@ def run_download_process(args: list[str], live: bool) -> ProcessResult:
     try:
         process = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=None,
             stderr=subprocess.PIPE,
             text=True,
@@ -1836,6 +1915,8 @@ def build_download_args(
             "10",
             "--fragment-retries",
             "10",
+            "--concurrent-fragments",
+            str(DOWNLOAD_CONNECTIONS),
             "--paths",
             f"home:{task_dir}",
             "--paths",
@@ -1853,6 +1934,24 @@ def build_download_args(
             download_container,
         )
     )
+    if not live:
+        # aria2c can split ordinary HTTP(S) files across eight connections.
+        # Segmented DASH/HLS media stays on yt-dlp's native downloader, where
+        # --concurrent-fragments provides the corresponding eight-way download.
+        args.extend(
+            (
+                "--downloader",
+                "aria2c",
+                "--downloader",
+                "dash,m3u8:native",
+                "--downloader-args",
+                (
+                    f"aria2c:-x {DOWNLOAD_CONNECTIONS} -s {DOWNLOAD_CONNECTIONS} "
+                    f"-j {DOWNLOAD_CONNECTIONS} -k 1M --file-allocation=none "
+                    "--summary-interval=1"
+                ),
+            )
+        )
     if live:
         args.append("--no-live-from-start")
     args.append(url)
@@ -2602,6 +2701,189 @@ def windows_cleanup_helper_is_owned() -> bool:
         return False
 
 
+def update_source() -> tuple[str, str]:
+    value = read_json(
+        UPDATE_CONFIG_FILE,
+        {"repository": DEFAULT_UPDATE_REPOSITORY, "ref": "main"},
+    )
+    if not isinstance(value, dict):
+        raise DwError("更新源配置损坏，请重新运行安装命令修复。")
+    repository = str(value.get("repository") or DEFAULT_UPDATE_REPOSITORY).strip()
+    reference = str(value.get("ref") or "main").strip()
+    repository_pattern = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    reference_pattern = r"[A-Za-z0-9._/-]+"
+    unsafe_reference = (
+        reference.startswith(("/", "-"))
+        or reference.endswith("/")
+        or ".." in reference
+        or "//" in reference
+    )
+    if (
+        not re.fullmatch(repository_pattern, repository)
+        or not re.fullmatch(reference_pattern, reference)
+        or unsafe_reference
+    ):
+        raise DwError("更新源配置无效，请重新运行安装命令修复。")
+    return repository, reference
+
+
+def update_helper_is_owned() -> bool:
+    if not IS_WINDOWS:
+        return True
+    try:
+        return "dw-managed-windows-update" in WINDOWS_UPDATE_HELPER.read_text(
+            encoding="utf-8", errors="ignore"
+        )[:512]
+    except OSError:
+        return False
+
+
+def download_update_installer(repository: str, reference: str) -> Path:
+    filename = "install-windows.ps1" if IS_WINDOWS else "install.sh"
+    quoted_reference = urllib.parse.quote(reference, safe="/")
+    official = f"https://raw.githubusercontent.com/{repository}/{quoted_reference}/{filename}"
+    jsdelivr = f"https://cdn.jsdelivr.net/gh/{repository}@{quoted_reference}/{filename}"
+    identity = "yt-dlp-dw Windows 10/11" if IS_WINDOWS else "yt-dlp-dw"
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        UPDATE_DIR.chmod(0o700)
+    destination = UPDATE_DIR / f"{Path(filename).stem}-{uuid.uuid4().hex}{Path(filename).suffix}"
+    failures: list[str] = []
+    for url in (official, jsdelivr):
+        try:
+            download_file(url, destination)
+            content = destination.read_text(encoding="utf-8", errors="ignore")
+            if identity not in content[:65536]:
+                raise DwError("下载的更新安装器未通过身份校验。")
+            return destination
+        except (DwError, OSError) as exc:
+            failures.append(str(exc))
+            with contextlib.suppress(OSError):
+                destination.unlink()
+    with contextlib.suppress(OSError):
+        UPDATE_DIR.rmdir()
+    raise DwError("所有程序更新源均不可用。", "\n".join(failures))
+
+
+def schedule_windows_update(installer: Path, repository: str, reference: str) -> None:
+    if not update_helper_is_owned():
+        raise DwError(f"Windows 更新器缺失或不属于 dw：{WINDOWS_UPDATE_HELPER}")
+    powershell = shutil.which("powershell.exe") or str(
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    command = [
+        powershell,
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(WINDOWS_UPDATE_HELPER),
+        "-ParentPid",
+        str(os.getpid()),
+        "-Installer",
+        str(installer),
+        "-StateDir",
+        str(STATE_DIR),
+        "-Repository",
+        repository,
+        "-RepositoryRef",
+        reference,
+    ]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except OSError as exc:
+        raise DwError("无法启动 Windows 程序更新器。", str(exc)) from exc
+
+
+_DEBIAN_UPDATE_RUNNER = r"""
+import os
+import subprocess
+import sys
+import time
+
+parent_pid = int(sys.argv[1])
+installer, repository, reference = sys.argv[2:]
+while True:
+    try:
+        os.kill(parent_pid, 0)
+    except ProcessLookupError:
+        break
+    except PermissionError:
+        break
+    time.sleep(0.2)
+environment = os.environ.copy()
+environment["DW_REPO_REF"] = reference
+environment["DW_UPDATE_REF"] = reference
+try:
+    result = subprocess.run(["/bin/bash", installer], env=environment, check=False)
+    if result.returncode == 0:
+        print("dw 程序更新完成。下次输入 dw 即为新版本。", flush=True)
+    else:
+        print(f"错误：dw 程序更新失败，安装器退出码 {result.returncode}。", file=sys.stderr, flush=True)
+finally:
+    try:
+        os.unlink(installer)
+    except OSError:
+        pass
+    try:
+        os.rmdir(os.path.dirname(installer))
+    except OSError:
+        pass
+"""
+
+
+def schedule_debian_update(installer: Path, repository: str, reference: str) -> None:
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _DEBIAN_UPDATE_RUNNER,
+                str(os.getpid()),
+                str(installer),
+                repository,
+                reference,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise DwError("无法启动 Debian 程序更新器。", str(exc)) from exc
+
+
+def prepare_self_update() -> None:
+    repository, reference = update_source()
+    if IS_WINDOWS and not update_helper_is_owned():
+        raise DwError("当前安装缺少菜单更新组件，请先重新运行一次安装命令完成升级。")
+    info(f"正在获取 dw 程序更新：{repository}@{reference} …")
+    installer = download_update_installer(repository, reference)
+    try:
+        if IS_WINDOWS:
+            schedule_windows_update(installer, repository, reference)
+        else:
+            schedule_debian_update(installer, repository, reference)
+    except DwError:
+        with contextlib.suppress(OSError):
+            installer.unlink()
+        with contextlib.suppress(OSError):
+            UPDATE_DIR.rmdir()
+        raise
+    info("更新已准备完成；dw 退出后会自动安装。请暂时不要关闭当前终端。")
+
+
 def schedule_windows_cleanup() -> str | None:
     if not windows_cleanup_helper_is_owned():
         return f"Windows 卸载清理器缺失或不属于 dw：{WINDOWS_UNINSTALL_HELPER}"
@@ -2823,6 +3105,7 @@ def main_menu() -> None:
             info("\n========== dw 下载助手 ==========")
             info("1. 开始下载")
             info("2. 卸载 dw")
+            info("3. 更新 dw")
             info("0. 退出")
             choice = input("请选择：").strip()
             if choice == "0":
@@ -2830,8 +3113,11 @@ def main_menu() -> None:
             if choice == "2":
                 uninstall()
                 return
+            if choice == "3":
+                prepare_self_update()
+                return
             if choice != "1":
-                warn("请输入 0、1 或 2。")
+                warn("请输入 0、1、2 或 3。")
                 continue
             while True:
                 try:

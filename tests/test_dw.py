@@ -248,6 +248,50 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(args[args.index("--merge-output-format") + 1], "mkv")
         self.assertEqual(args[args.index("--remux-video") + 1], "mkv")
 
+    def test_non_live_download_uses_eight_way_native_and_aria2_downloaders(self) -> None:
+        selection = dw.ItemSelection(
+            video=video("v1", "mp4", 1080),
+            audios=[audio("a1", "zh", codec="aac")],
+            use_embedded_audio=False,
+            replace_embedded_audio=False,
+            container_mode="mp4",
+            resolved_container="mp4",
+            thumbnails=[],
+        )
+        args = dw.build_download_args(
+            "https://example.test/video",
+            selection,
+            Path("/tmp/task"),
+            Path("/tmp/task/result.txt"),
+            False,
+        )
+        self.assertEqual(args[args.index("--concurrent-fragments") + 1], "8")
+        downloader_values = [args[index + 1] for index, value in enumerate(args) if value == "--downloader"]
+        self.assertEqual(downloader_values, ["aria2c", "dash,m3u8:native"])
+        aria_arguments = args[args.index("--downloader-args") + 1]
+        self.assertIn("-x 8", aria_arguments)
+        self.assertIn("-s 8", aria_arguments)
+
+    def test_live_download_keeps_native_downloader(self) -> None:
+        selection = dw.ItemSelection(
+            video=video("v1", "mp4", 1080, acodec="aac"),
+            audios=[],
+            use_embedded_audio=True,
+            replace_embedded_audio=False,
+            container_mode="mp4",
+            resolved_container="mp4",
+            thumbnails=[],
+        )
+        args = dw.build_download_args(
+            "https://example.test/live",
+            selection,
+            Path("/tmp/task"),
+            Path("/tmp/task/result.txt"),
+            True,
+        )
+        self.assertEqual(args[args.index("--concurrent-fragments") + 1], "8")
+        self.assertNotIn("--downloader", args)
+
     def test_container_menu_enter_defaults_to_auto(self) -> None:
         selected_video = video("v", "mp4", 1080, acodec="aac")
         with mock.patch("builtins.input", return_value=""):
@@ -337,11 +381,28 @@ class PlatformSupportTests(unittest.TestCase):
         stderr = mock.Mock()
         with mock.patch.object(dw, "IS_WINDOWS", True), mock.patch.object(
             dw.sys, "stdout", stdout
-        ), mock.patch.object(dw.sys, "stderr", stderr):
+        ), mock.patch.object(dw.sys, "stderr", stderr), mock.patch.object(
+            dw, "disable_windows_quick_edit"
+        ) as disable_quick_edit:
             dw.configure_console()
 
+        disable_quick_edit.assert_called_once_with()
         stdout.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
         stderr.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+
+    def test_download_process_cannot_pause_waiting_for_console_input(self) -> None:
+        process = mock.Mock()
+        process.stderr = io.StringIO("")
+        process.wait.return_value = 0
+        with mock.patch.object(dw.subprocess, "Popen", return_value=process) as popen:
+            result = dw.run_download_process(["yt-dlp", "url"], live=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertIs(popen.call_args.kwargs["stdin"], dw.subprocess.DEVNULL)
+
+    def test_ytdlp_environment_can_find_portable_aria2(self) -> None:
+        with mock.patch.dict(dw.os.environ, {"PATH": "existing-path"}, clear=False):
+            environment = dw.ytdlp_environment()
+        self.assertEqual(environment["PATH"].split(dw.os.pathsep)[0], str(dw.BIN_DIR))
 
     def test_dependency_http_query_retries_transient_failure(self) -> None:
         response = io.StringIO('{"ok": true}')
@@ -542,6 +603,99 @@ class PlatformSupportTests(unittest.TestCase):
             self.assertEqual(arguments[arguments.index("-StateDir") + 1], str(state))
             self.assertEqual(arguments[arguments.index("-CommandDir") + 1], str(command))
             self.assertEqual(arguments[arguments.index("-AliasLauncher") + 1], str(alias))
+
+    def test_update_source_is_validated(self) -> None:
+        with writable_test_directory() as temp:
+            config = Path(temp) / "update-source.json"
+            config.write_text(
+                '{"repository":"owner/project","ref":"release/v1.3.0"}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(dw, "UPDATE_CONFIG_FILE", config):
+                self.assertEqual(dw.update_source(), ("owner/project", "release/v1.3.0"))
+            config.write_text(
+                '{"repository":"owner/project","ref":"../unsafe"}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(dw, "UPDATE_CONFIG_FILE", config), self.assertRaises(dw.DwError):
+                dw.update_source()
+
+    def test_windows_update_is_started_with_validated_helper_and_source(self) -> None:
+        with writable_test_directory() as temp:
+            root = Path(temp)
+            helper = root / "update-windows.ps1"
+            installer = root / "state" / "update" / "install-windows.ps1"
+            helper.write_text("# dw-managed-windows-update\n", encoding="utf-8")
+            installer.parent.mkdir(parents=True)
+            installer.write_text("# yt-dlp-dw Windows 10/11\n", encoding="utf-8")
+            with mock.patch.multiple(
+                dw,
+                IS_WINDOWS=True,
+                WINDOWS_UPDATE_HELPER=helper,
+                STATE_DIR=root / "state",
+            ), mock.patch.object(dw.shutil, "which", return_value="powershell.exe"), mock.patch.object(
+                dw.subprocess, "Popen"
+            ) as popen:
+                dw.schedule_windows_update(installer, "owner/project", "main")
+            arguments = popen.call_args.args[0]
+            self.assertEqual(arguments[0], "powershell.exe")
+            self.assertEqual(arguments[arguments.index("-Installer") + 1], str(installer))
+            self.assertEqual(arguments[arguments.index("-Repository") + 1], "owner/project")
+            self.assertEqual(arguments[arguments.index("-RepositoryRef") + 1], "main")
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell integration test")
+    def test_windows_update_helper_executes_validated_installer_and_cleans_it(self) -> None:
+        helper = MODULE_PATH.parents[1] / "windows" / "update-runner.ps1"
+        with writable_test_directory() as temp:
+            root = Path(temp)
+            state = root / "state"
+            update_dir = state / "update"
+            update_dir.mkdir(parents=True)
+            (state / ".dw-owned").write_text("owned by yt-dlp-dw\n", encoding="utf-8")
+            result_file = root / "updated.txt"
+            installer = update_dir / "install-windows.ps1"
+            installer.write_text(
+                "# yt-dlp-dw Windows 10/11\n"
+                "[CmdletBinding()]\n"
+                "param([string]$Repository,[string]$RepositoryRef,[string]$UpdateRef)\n"
+                "[IO.File]::WriteAllText($env:DW_TEST_UPDATE_RESULT, "
+                "\"$Repository@$RepositoryRef@$UpdateRef\")\n",
+                encoding="ascii",
+            )
+            environment = dw.os.environ.copy()
+            environment["DW_TEST_UPDATE_RESULT"] = str(result_file)
+            result = dw.subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(helper),
+                    "-ParentPid",
+                    "2147483647",
+                    "-Installer",
+                    str(installer),
+                    "-StateDir",
+                    str(state),
+                    "-Repository",
+                    "owner/project",
+                    "-RepositoryRef",
+                    "test-branch",
+                ],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=dw.subprocess.PIPE,
+                stderr=dw.subprocess.STDOUT,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result_file.read_text(encoding="utf-8"), "owner/project@test-branch@test-branch")
+            self.assertFalse(installer.exists())
+            self.assertFalse(update_dir.exists())
 
 
 class FilesystemSafetyTests(unittest.TestCase):

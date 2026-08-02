@@ -8,6 +8,7 @@ readonly STATE_DIR="/var/lib/dw"
 readonly LAUNCHER="/usr/local/bin/dw"
 readonly REPOSITORY="lucaskevin9510-beep/yt-dlp-dw"
 readonly REPOSITORY_REF="${DW_REPO_REF:-main}"
+readonly UPDATE_REF="${DW_UPDATE_REF:-${REPOSITORY_REF}}"
 readonly RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/${REPOSITORY_REF}"
 readonly JSDELIVR_BASE="https://cdn.jsdelivr.net/gh/${REPOSITORY}@${REPOSITORY_REF}"
 
@@ -47,6 +48,12 @@ case "$(uname -m)" in
     *) fail "当前仅支持 x86_64/amd64，检测到：$(uname -m)。" ;;
 esac
 
+for reference in "${REPOSITORY_REF}" "${UPDATE_REF}"; do
+    if [[ ! "${reference}" =~ ^[A-Za-z0-9._/-]+$ || "${reference}" == -* || "${reference}" == /* || "${reference}" == */ || "${reference}" == *..* || "${reference}" == *//* ]]; then
+        fail "仓库版本标识无效。"
+    fi
+done
+
 if [[ -e "${APP_DIR}" && ! -f "${APP_DIR}/.dw-owned" ]]; then
     fail "${APP_DIR} 已存在但不属于 dw，为避免覆盖已停止安装。"
 fi
@@ -72,7 +79,7 @@ new_packages="${TEMP_DIR}/packages-new.txt"
 dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | LC_ALL=C sort -u > "${before_packages}" || true
 
 required_packages=()
-for package in python3 ca-certificates; do
+for package in python3 ca-certificates aria2; do
     if ! dpkg-query -W -f='${Status}' "${package}" 2>/dev/null | grep -q '^install ok installed$'; then
         required_packages+=("${package}")
     fi
@@ -216,7 +223,28 @@ finally:
         pass
 PY
 
-printf '正在安装并校验 yt-dlp、Deno 和 FFmpeg …\n'
+python3 - "${STATE_DIR}/update-source.json" "${REPOSITORY}" "${UPDATE_REF}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+destination, repository, reference = sys.argv[1:]
+fd, temporary = tempfile.mkstemp(prefix=".update-source.", dir=os.path.dirname(destination))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"repository": repository, "ref": reference}, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+
+printf '正在安装并校验 yt-dlp、Deno、FFmpeg 和 aria2 …\n'
 python3 "${APP_DIR}/dw.py" --install-dependencies --force
 
 launcher_temp="${TEMP_DIR}/dw-launcher"

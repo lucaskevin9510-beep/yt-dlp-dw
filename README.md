@@ -18,16 +18,17 @@
 | Cookies | 每次任务可选“手动 `cookies.txt`”或“不使用”；直接回车默认使用固定位置的手动文件 |
 | 标签与水印源 | 最终无损重封装会删除容器元数据/平台标签；存在干净流时自动排除 yt-dlp 明确标记的带水印流 |
 | 网络策略 | 国内网站优先强制直连；直连失败后才询问是否使用系统代理，不静默切换 |
+| 下载速度 | 普通 HTTP/HTTPS 文件使用 aria2c 进行 8 连接分片；HLS/DASH 使用 yt-dlp 原生 8 片段并发 |
 | GitHub 容错 | 官方源不可用时可回退至 jsDelivr 和多个第三方加速源；支持用户自定义 HTTPS 镜像 |
 | 直播 | 可录制正在直播、即将开始或持续直播的内容；支持安全停止与强制取消 |
 | 输出与清理 | Windows 保存到 Downloads，Debian 保存到 `/root`；同名自动改名，失败或取消时按任务清理 |
-| 依赖与卸载 | 自动安装或更新 yt-dlp nightly、Deno、FFmpeg，实时显示百分比、已下载大小和速度；提供带清单保护的完整卸载功能 |
+| 更新与卸载 | 主菜单可一键更新；自动安装或更新 yt-dlp nightly、Deno、FFmpeg、aria2c，依赖下载实时显示进度；提供带清单保护的完整卸载功能 |
 
 ## 快速安装
 
 ### Windows 10/11 x64
 
-无需管理员权限，也不需要预装 Python、yt-dlp、Deno 或 FFmpeg。打开 **PowerShell** 或 Windows Terminal，运行下面的自动回退安装命令。它会按顺序尝试 GitHub 官方源、jsDelivr、gh-proxy.com、ghfast.top 和 ghproxy.net：
+无需管理员权限，也不需要预装 Python、yt-dlp、Deno、FFmpeg 或 aria2c。打开 **PowerShell** 或 Windows Terminal，运行下面的自动回退安装命令。它会按顺序尝试 GitHub 官方源、jsDelivr、gh-proxy.com、ghfast.top 和 ghproxy.net：
 
 ```powershell
 $sources = @(
@@ -60,7 +61,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestM
 dw
 ```
 
-安装 Python、yt-dlp、Deno 和 FFmpeg 时会实时显示类似 `45.2% | 38.6 MiB / 85.4 MiB | 5.1 MiB/s` 的进度。服务器不提供总大小时，仍会显示已下载大小和速度。
+安装 Python、yt-dlp、Deno、FFmpeg 和 aria2c 时会实时显示类似 `45.2% | 38.6 MiB / 85.4 MiB | 5.1 MiB/s` 的进度。服务器不提供总大小时，仍会显示已下载大小和速度。
 
 安装器还会在 Windows 已有的 `%LOCALAPPDATA%\Microsoft\WindowsApps` 中创建一个受管理的 `dw.cmd` 即时别名，因此已经打开的 Windows Terminal 新标签页也不需要手动执行 `$env:Path += ...`。如果该位置已有不属于 `dw` 的同名文件，安装器不会覆盖，并会显示可直接运行的完整入口。Windows 的安装、使用、Cookies、更新、卸载和故障处理详见 [Windows 10/11 完整说明](docs/WINDOWS.md)。
 
@@ -254,7 +255,7 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 
 | 操作 | 可以输入 |
 |---|---|
-| 主菜单 | `1` 下载、`2` 卸载、`0` 退出 |
+| 主菜单 | `1` 下载、`2` 卸载、`3` 更新、`0` 退出 |
 | 是/否问题 | `y`/`n`、`yes`/`no`、`是`/`否`、`1`/`0` |
 | `[Y/n]` | 大写的 `Y` 表示默认“是”，直接按回车等于 `y` |
 | `[y/N]` | 大写的 `N` 表示默认“否”，直接按回车等于 `n` |
@@ -319,7 +320,7 @@ dw
 
 ### 更新程序与进入卸载
 
-重新运行当前平台在“快速安装”中的安装命令即可更新 `dw` 主程序，现有下载清单和设置会保留。需要卸载时运行 `dw`，在主菜单选择 `2`；卸载会进一步要求输入完整确认文字，详细删除范围见下方“安全卸载”。
+运行 `dw` 并在主菜单选择 `3. 更新 dw`，程序会显示安装器下载进度，并在当前 `dw` 退出后自动安装新版本，无需再次输入一长串安装命令。更新会保留下载清单、设置、成品和手动 `cookies.txt`。只有从不含菜单更新组件的旧版本首次升级时，才需要重新运行一次“快速安装”命令。需要卸载时在主菜单选择 `2`；卸载会进一步要求输入完整确认文字，详细删除范围见下方“安全卸载”。
 
 > **卸载警告：** 完整确认卸载后，程序会删除清单中由 `dw` 下载且仍在原路径的全部视频和图片，而不只是删除脚本本身。需要保留的文件请先手动移动或改名，并仔细阅读下方“安全卸载”。
 
@@ -336,8 +337,8 @@ dw
 
 - 检查系统版本和 CPU 架构；Debian 额外检查 `root` 权限；
 - Windows 安装经过固定 SHA-256 校验的官方嵌入式 Python，不使用系统 Python；
-- Debian 在缺失时通过 APT 安装最小引导依赖（Python 3、CA 证书）；
-- 安装并校验 yt-dlp nightly、Deno、FFmpeg 和 FFprobe 的官方发布文件；
+- Debian 在缺失时通过 APT 安装最小引导依赖（Python 3、CA 证书、aria2）；
+- 安装并校验 yt-dlp nightly、Deno、FFmpeg、FFprobe 和 aria2c；
 - 将应用、便携依赖、缓存、任务和清单放在平台专用目录；
 - 创建 `dw` 命令；Windows 写入当前用户 PATH，并在既有 WindowsApps 命令目录创建受管理的即时别名；Debian 创建 `/usr/local/bin/dw`。
 
@@ -349,6 +350,7 @@ dw
 ========== dw 下载助手 ==========
 1. 开始下载
 2. 卸载 dw
+3. 更新 dw
 0. 退出
 请选择：
 ```
@@ -360,6 +362,12 @@ dw
 ```
 
 完成一次任务后，程序会询问是否继续输入下一个链接。
+
+## 8 路并发与 Windows 卡顿处理
+
+普通 HTTP/HTTPS 媒体文件默认由 aria2c 使用 8 个连接分片下载；HLS/DASH 分段流仍由 yt-dlp 原生下载器处理，并同时下载 8 个片段。直播只使用 yt-dlp 原生下载器，避免外部下载器影响持续录制。这里的“8 路”是网络连接/片段并发，不是视频转码线程；实际速度仍受网站限速、CDN、是否支持 Range、磁盘和线路质量限制，不能保证所有链接都跑满宽带。
+
+Windows 启动时会关闭经典控制台的“快速编辑”暂停，并让 yt-dlp/aria2c 不再读取交互输入，避免下载进程等待回车。`Ctrl+C` 取消逻辑仍然保留。如果旧窗口已经进入文字选择状态，先按 `Esc` 退出选择，再通过主菜单更新并重新打开 `dw`。
 
 ## 视频格式选择
 
@@ -575,9 +583,10 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 
 - yt-dlp nightly；
 - Deno；
-- yt-dlp 官方 FFmpeg/FFprobe 构建。
+- yt-dlp 官方 FFmpeg/FFprobe 构建；
+- Windows 便携 aria2c（Debian 使用 APT 安装的 aria2）。
 
-依赖查询和 GitHub Release 下载同样使用自定义镜像、官方源和内置回退源。应用自身不会静默更新。更新 `dw` 主程序时重新运行安装命令即可，下载清单和设置会保留。
+依赖查询和 GitHub Release 下载同样使用自定义镜像、官方源和内置回退源。应用自身不会静默更新：只有用户在主菜单选择 `3. 更新 dw` 后，才会下载并运行程序安装器。更新完成后重新输入 `dw`；下载清单、设置、成品和手动 Cookies 均保留。
 
 ## 安全卸载
 
@@ -611,13 +620,15 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 |---|---|
 | `%LOCALAPPDATA%\yt-dlp-dw\dw.py` | 主程序 |
 | `%LOCALAPPDATA%\yt-dlp-dw\python\` | 隔离的官方嵌入式 Python |
-| `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe |
+| `%LOCALAPPDATA%\yt-dlp-dw\bin\` | yt-dlp、Deno、FFmpeg、FFprobe、aria2c |
+| `%LOCALAPPDATA%\yt-dlp-dw\update-windows.ps1` | 主菜单更新使用的受管理更新器 |
 | `%LOCALAPPDATA%\yt-dlp-dw\command\dw.cmd` | 命令入口，加入当前用户 PATH |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps\dw.cmd` | 受管理的即时命令别名；卸载时一并删除 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\cache\` | 专用缓存 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\tasks\` | 下载事务临时目录 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\downloads.json` | 卸载使用的下载文件清单 |
 | `%LOCALAPPDATA%\yt-dlp-dw-data\github-mirrors.txt` | 用户可选的持久 GitHub 镜像列表 |
+| `%LOCALAPPDATA%\yt-dlp-dw-data\update-source.json` | 主菜单更新所跟随的仓库和版本标识 |
 | `%USERPROFILE%\Downloads\` | 默认成品位置，可能被 Windows 重定向 |
 | `%USERPROFILE%\cookies.txt` | 用户可选提供的 Cookies |
 
@@ -627,11 +638,12 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 |---|---|
 | `/usr/local/bin/dw` | 命令入口 |
 | `/opt/dw/dw.py` | 主程序 |
-| `/opt/dw/bin/` | 隔离的 yt-dlp、Deno、FFmpeg、FFprobe |
+| `/opt/dw/bin/` | 隔离的 yt-dlp、Deno、FFmpeg、FFprobe（aria2c 位于 `/usr/bin`） |
 | `/var/lib/dw/cache/` | yt-dlp 与 Deno 专用缓存 |
 | `/var/lib/dw/tasks/` | 下载事务临时目录 |
 | `/var/lib/dw/downloads.json` | 卸载使用的下载文件清单 |
 | `/var/lib/dw/github-mirrors.txt` | 用户可选的持久 GitHub 镜像列表 |
+| `/var/lib/dw/update-source.json` | 主菜单更新所跟随的仓库和版本标识 |
 | `/root/` | 最终视频和 PNG 图片 |
 | `/root/cookies.txt` | 用户可选提供的 cookies，不属于程序生成文件 |
 
@@ -640,6 +652,14 @@ C:\Users\你的用户名\Downloads\视频标题_thumbnail_1_1920x1080.png
 ### 显示的文件大小为什么是“未知”？
 
 部分网站或流媒体清单不会提前提供文件大小。该格式仍可正常选择和下载。
+
+### 为什么下载时仍然跑不满千兆宽带？
+
+`dw` 已默认启用 8 路连接/片段并发，但网站可能限制单 IP、单视频或单 CDN 节点速度，也可能不支持 HTTP Range。8 路会改善允许分片的资源，不代表能绕过服务端限速；速度显示以 yt-dlp/aria2c 的实时输出为准。
+
+### 为什么下载像卡住，按回车后才继续？
+
+旧版常见原因是经典 Windows 控制台进入“快速编辑/文字选择”状态，整个控制台进程会暂停。新版会在启动时关闭该暂停模式，并切断下载子进程的标准输入，不再依靠敲回车推进。若当前窗口已经选中了文字，先按 `Esc`，选择主菜单 `3` 更新，然后重新启动 `dw`。
 
 ### 为什么不能选择 MP4？
 
@@ -690,6 +710,7 @@ GitHub Actions 会分别在 Ubuntu 和 Windows 上使用 Python 3.11、3.13 执�
 - [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds)
 - [denoland/deno](https://github.com/denoland/deno)
+- [aria2/aria2](https://github.com/aria2/aria2)
 - [Python](https://www.python.org/)
 
 本仓库代码使用 MIT License。安装器下载的第三方程序分别遵循各自许可证；FFmpeg 构建的具体许可信息以其发布包为准。
